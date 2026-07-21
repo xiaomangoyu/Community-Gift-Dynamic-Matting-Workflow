@@ -13,6 +13,7 @@ from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_PREVIEW_SECONDS = 3.0
 
 
 def sha256_file(path: Path) -> str:
@@ -72,10 +73,12 @@ def main() -> int:
         out_duration, out_fps, out_frames, out_width, out_height = duration_and_frames(preview)
         if (out_width, out_height) != (780, 1688):
             errors.append(f"row {row:03d}: preview is {out_width}x{out_height}")
-        if abs(source_fps - out_fps) > 0.01 or abs(source_frames - out_frames) > 1:
+        expected_duration = min(EXPECTED_PREVIEW_SECONDS, source_duration)
+        expected_frames = round(expected_duration * source_fps)
+        if abs(source_fps - out_fps) > 0.01 or abs(expected_frames - out_frames) > 1:
             errors.append(f"row {row:03d}: fps/frame mismatch")
-        if abs(source_duration - out_duration) > max(1 / source_fps, 0.05):
-            errors.append(f"row {row:03d}: duration mismatch")
+        if abs(expected_duration - out_duration) > max(1 / source_fps, 0.05):
+            errors.append(f"row {row:03d}: expected {expected_duration:.3f}s preview, got {out_duration:.3f}s")
         if args.original_root:
             for relative in (item["input_image"], item["input_video"]):
                 copied, original = ROOT / relative, args.original_root / relative

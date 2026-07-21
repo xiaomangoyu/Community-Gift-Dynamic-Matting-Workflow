@@ -44,6 +44,8 @@ LIVE_HEIGHT = 1688
 LIVE_SLOT_X = 0
 LIVE_SLOT_Y = 908
 FADE_SECONDS = 0.3
+PREVIEW_DURATION_SECONDS = 3.0
+LIVE_SUBJECT_SCALE = 0.8
 
 
 def parse_args() -> argparse.Namespace:
@@ -320,8 +322,12 @@ def inspect_existing_video(path: Path) -> dict[str, Any]:
         }
 
 
-def fit_rgba(image: Image.Image, size: tuple[int, int]) -> Image.Image:
-    scale = min(size[0] / image.width, size[1] / image.height)
+def fit_rgba(image: Image.Image, size: tuple[int, int], content_scale: float = 1.0) -> Image.Image:
+    if not 0 < content_scale <= 1:
+        raise ValueError("content_scale must be in the range (0, 1]")
+    target_width = size[0] * content_scale
+    target_height = size[1] * content_scale
+    scale = min(target_width / image.width, target_height / image.height)
     resized = image.resize(
         (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
         Image.Resampling.LANCZOS,
@@ -372,6 +378,8 @@ def process_video(
     rate = input_stream.average_rate or Fraction(24, 1)
     fps = float(rate)
     duration = video_duration_seconds(input_container, input_stream)
+    clip_duration = min(PREVIEW_DURATION_SECONDS, duration) if duration > 0 else PREVIEW_DURATION_SECONDS
+    clip_frame_limit = max(1, round(clip_duration * fps))
     output_container = av.open(str(temporary), mode="w", options={"movflags": "+faststart"})
     encoder = select_encoder(requested_encoder, decision.backend)
     output_stream = output_container.add_stream(encoder, rate=rate)
@@ -389,15 +397,21 @@ def process_video(
     frame_count = 0
     try:
         for frame in input_container.decode(input_stream):
+            if frame_count >= clip_frame_limit:
+                break
             rgb = frame.to_ndarray(format="rgb24")
             if sampled is None:
                 sampled, inner, outer = tune_key(rgb, declared)
             rgba = scheduler.run_matte(decision, rgb, sampled, inner, outer, matte_rgba)
             elapsed = frame_count / fps
-            remaining = max(0.0, duration - ((frame_count + 1) / fps)) if duration else FADE_SECONDS
+            remaining = max(0.0, clip_duration - ((frame_count + 1) / fps))
             fade = min(1.0, elapsed / FADE_SECONDS, remaining / FADE_SECONDS)
             rgba[:, :, 3] = np.round(rgba[:, :, 3].astype(np.float32) * max(0.0, fade)).astype(np.uint8)
-            layer = fit_rgba(Image.fromarray(rgba, mode="RGBA"), (ICON_SIZE, ICON_SIZE))
+            layer = fit_rgba(
+                Image.fromarray(rgba, mode="RGBA"),
+                (ICON_SIZE, ICON_SIZE),
+                content_scale=LIVE_SUBJECT_SCALE,
+            )
             composite = background.copy()
             composite.alpha_composite(layer, (LIVE_SLOT_X, LIVE_SLOT_Y))
             output_frame = av.VideoFrame.from_ndarray(np.asarray(composite.convert("RGB")), format="rgb24")
@@ -425,6 +439,10 @@ def process_video(
         "fps": round(fps, 4),
         "frame_count": frame_count,
         "duration_seconds": round(frame_count / fps, 3),
+        "source_duration_seconds": round(duration, 3),
+        "clip_start_seconds": 0.0,
+        "clip_target_seconds": PREVIEW_DURATION_SECONDS,
+        "subject_scale": LIVE_SUBJECT_SCALE,
         "dimensions": {"width": LIVE_WIDTH, "height": LIVE_HEIGHT},
         "codec": "h264",
         "pixel_format": "yuv420p",
@@ -511,7 +529,7 @@ def build_viewer_html(manifest: dict[str, Any]) -> str:
   <script id="matting-data" type="application/json">{embedded}</script>
   <script>
     const DATA=JSON.parse(document.getElementById('matting-data').textContent); const rows=DATA.items;
-    const TEXT={{zh:{{title:'抠图效果预览',review:'返回结果审核台',workflow:'工作流画布',previous:'上一位',next:'下一位',originalImage:'原始幕布图片',transparentIcon:'透明 Icon · 780×780',originalVideo:'原始幕布视频',panelVideo:'BG71 直播间面板视频',footer:'Windows 设计验证版 · 色键抠图 · 原素材保持不变',success:'处理成功',failed:'处理失败',row:'第'}},en:{{title:'Matting Preview',review:'Back to Review',workflow:'Workflow Canvas',previous:'Previous',next:'Next',originalImage:'Original Chroma Image',transparentIcon:'Transparent Icon · 780×780',originalVideo:'Original Chroma Video',panelVideo:'BG71 Live Panel Video',footer:'Windows design prototype · Chroma key · Original assets preserved',success:'Processed',failed:'Processing Failed',row:'Row'}}}};
+    const TEXT={{zh:{{title:'抠图效果预览',review:'返回结果审核台',workflow:'工作流画布',previous:'上一位',next:'下一位',originalImage:'原始幕布图片',transparentIcon:'透明 Icon · 780×780',originalVideo:'原始幕布视频',panelVideo:'BG71 直播间面板视频',footer:'Seedance 源视频为 5 秒 · 面板预览取首帧开始的前 3 秒 · 原素材保持不变',success:'处理成功',failed:'处理失败',row:'第'}},en:{{title:'Matting Preview',review:'Back to Review',workflow:'Workflow Canvas',previous:'Previous',next:'Next',originalImage:'Original Chroma Image',transparentIcon:'Transparent Icon · 780×780',originalVideo:'Original Chroma Video',panelVideo:'BG71 Live Panel Video',footer:'Seedance source: 5s · Panel preview: first 3s from frame 0 · Original assets preserved',success:'Processed',failed:'Processing Failed',row:'Row'}}}};
     let language=localStorage.getItem('mattingDemoLanguage')==='en'?'en':'zh'; let current=0;
     const $=id=>document.getElementById(id); const rowSelect=$('rowSelect');
     function applyLanguage(){{document.documentElement.lang=language==='en'?'en':'zh-CN'; document.querySelectorAll('[data-i18n]').forEach(node=>node.textContent=TEXT[language][node.dataset.i18n]); $('languageButton').textContent=language==='zh'?'English':'中文'; document.title=TEXT[language].title; renderSelect(); render();}}
@@ -694,7 +712,17 @@ def main() -> int:
         "background": rel(BG_PATH),
         "scheduler": scheduler.diagnostics(),
         "icon_spec": {"width": ICON_SIZE, "height": ICON_SIZE, "content_max": ICON_CONTENT_SIZE, "anchor": "bottom_center"},
-        "video_spec": {"width": LIVE_WIDTH, "height": LIVE_HEIGHT, "codec": "h264", "pixel_format": "yuv420p", "fade_seconds": FADE_SECONDS, "slot": {"x": LIVE_SLOT_X, "y": LIVE_SLOT_Y}},
+        "video_spec": {
+            "width": LIVE_WIDTH,
+            "height": LIVE_HEIGHT,
+            "codec": "h264",
+            "pixel_format": "yuv420p",
+            "clip_start_seconds": 0.0,
+            "clip_duration_seconds": PREVIEW_DURATION_SECONDS,
+            "fade_seconds": FADE_SECONDS,
+            "subject_scale": LIVE_SUBJECT_SCALE,
+            "slot": {"x": LIVE_SLOT_X, "y": LIVE_SLOT_Y},
+        },
         "items": results,
     }
     atomic_write_json(MANIFEST_PATH, manifest)

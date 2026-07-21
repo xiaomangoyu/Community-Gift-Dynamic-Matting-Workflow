@@ -3,7 +3,7 @@
 一个面向设计验证的 Windows 色键抠图工作流。它从 Pak20 Viewer 的 `index.html` 中读取 `workflow-data`，批量生成：
 
 - 780×780 透明 PNG icon；
-- 780×1688、H.264、`yuv420p` 的 BG71 面板预览视频；
+- 从 Seedance 5 秒源视频首帧开始截取 3 秒，生成 780×1688、H.264、`yuv420p` 的 BG71 面板预览视频；
 - 包含中英文切换的 `matting_demo.html` 对比页面；
 - 逐行处理状态和输入哈希记录 `matting_demo_manifest.json`。
 
@@ -154,7 +154,7 @@ http://<Windows IPv4>:3001/matting_demo.html
 
 ### 视频
 
-每帧使用相同色键和边缘处理，再按原比例放入 780×780 透明层，定位到 BG71 的 `(0, 908)`。首尾各加入 0.3 秒淡入淡出，输出保持原始帧率和时长，静音编码为 H.264 MP4。
+Seedance 输入仍可保持 5 秒；预览从第 0 帧开始，只取前 3 秒。每帧使用相同色键和边缘处理，再按原比例缩放到原 slot 尺寸的 80%，放入 780×780 透明层并定位到 BG71 的 `(0, 908)`。3 秒片段首尾各加入 0.3 秒淡入淡出，输出保持原始 FPS，静音编码为 H.264 MP4。
 
 ## CUDA 调度
 
@@ -179,7 +179,7 @@ http://<Windows IPv4>:3001/matting_demo.html
 .venv\Scripts\python.exe tools\verify_matting_demo.py
 ```
 
-验证器会检查 icon 尺寸和透明度、视频编码/分辨率/帧率、20 行状态及输入哈希记录。
+验证器会检查 icon 尺寸和透明度、视频编码/分辨率/帧率、固定 3 秒时长、20 行状态及输入哈希记录。
 
 ## 已知限制
 
