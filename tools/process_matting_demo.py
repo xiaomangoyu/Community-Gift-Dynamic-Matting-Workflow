@@ -24,6 +24,8 @@ import av
 import numpy as np
 from PIL import Image, ImageFilter
 
+from gpu_scheduler import BackendDecision, CudaMattingError, MattingScheduler
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = ROOT / "index.html"
@@ -49,6 +51,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="Regenerate existing outputs.")
     parser.add_argument("--rows", default="", help="Optional rows such as 1-3,8.")
     parser.add_argument("--icons-only", action="store_true", help="Skip video processing.")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "cpu"),
+        default=os.getenv("MATTING_DEVICE", "auto"),
+        help="Matting backend. auto follows GPU utilization and falls back to CPU.",
+    )
+    parser.add_argument(
+        "--gpu-index",
+        type=int,
+        default=int(os.getenv("MATTING_GPU_INDEX", "0")),
+        help="NVIDIA GPU index used by CuPy and nvidia-smi.",
+    )
+    parser.add_argument(
+        "--gpu-util-threshold",
+        type=int,
+        default=int(os.getenv("MATTING_GPU_UTIL_THRESHOLD", "50")),
+        help="auto mode uses CPU when GPU utilization is at or above this percentage.",
+    )
+    parser.add_argument(
+        "--encoder",
+        choices=("auto", "nvenc", "libx264"),
+        default=os.getenv("MATTING_VIDEO_ENCODER", "auto"),
+        help="Video encoder. auto uses NVENC with CUDA and libx264 with CPU.",
+    )
     return parser.parse_args()
 
 
@@ -215,13 +241,19 @@ def icon_from_rgba(rgba: np.ndarray) -> Image.Image:
     return canvas
 
 
-def process_icon(source: Path, output: Path, key_hex: str) -> dict[str, Any]:
+def process_icon(
+    source: Path,
+    output: Path,
+    key_hex: str,
+    scheduler: MattingScheduler,
+    decision: BackendDecision,
+) -> dict[str, Any]:
     started = time.perf_counter()
     with Image.open(source) as image:
         rgb = np.asarray(image.convert("RGB"))
     declared = rgb_from_hex(key_hex)
     sampled, inner, outer = tune_key(rgb, declared)
-    rgba = matte_rgba(rgb, sampled, inner, outer)
+    rgba = scheduler.run_matte(decision, rgb, sampled, inner, outer, matte_rgba)
     icon = icon_from_rgba(rgba)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".tmp.png")
@@ -230,6 +262,9 @@ def process_icon(source: Path, output: Path, key_hex: str) -> dict[str, Any]:
     alpha = np.asarray(icon.getchannel("A"))
     return {
         "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "backend": decision.backend,
+        "gpu_utilization": decision.gpu_utilization,
+        "backend_reason": decision.reason,
         "sampled_key_rgb": [round(float(value), 2) for value in sampled],
         "key_inner": round(inner, 2),
         "key_outer": round(outer, 2),
@@ -257,6 +292,7 @@ def inspect_existing_icon(path: Path) -> dict[str, Any]:
         return {
             "status": "succeeded",
             "reused": True,
+            "backend": "reused",
             "elapsed_seconds": 0.0,
             "dimensions": {"width": rgba.width, "height": rgba.height},
             "alpha_bbox": alpha_bbox(alpha),
@@ -273,6 +309,7 @@ def inspect_existing_video(path: Path) -> dict[str, Any]:
         return {
             "status": "succeeded",
             "reused": True,
+            "backend": "reused",
             "elapsed_seconds": 0.0,
             "fps": round(fps, 4),
             "frame_count": frame_count,
@@ -304,7 +341,28 @@ def video_duration_seconds(container: av.container.InputContainer, stream: av.vi
     return 0.0
 
 
-def process_video(source: Path, output: Path, key_hex: str, background: Image.Image) -> dict[str, Any]:
+def select_encoder(requested: str, backend: str) -> str:
+    if requested == "libx264":
+        return "libx264"
+    if requested == "nvenc" or (requested == "auto" and backend == "cuda"):
+        try:
+            av.codec.Codec("h264_nvenc", "w")
+            return "h264_nvenc"
+        except Exception:
+            if requested == "nvenc":
+                raise RuntimeError("h264_nvenc is not available in this PyAV/FFmpeg build")
+    return "libx264"
+
+
+def process_video(
+    source: Path,
+    output: Path,
+    key_hex: str,
+    background: Image.Image,
+    scheduler: MattingScheduler,
+    decision: BackendDecision,
+    requested_encoder: str,
+) -> dict[str, Any]:
     started = time.perf_counter()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".tmp.mp4")
@@ -315,11 +373,15 @@ def process_video(source: Path, output: Path, key_hex: str, background: Image.Im
     fps = float(rate)
     duration = video_duration_seconds(input_container, input_stream)
     output_container = av.open(str(temporary), mode="w", options={"movflags": "+faststart"})
-    output_stream = output_container.add_stream("libx264", rate=rate)
+    encoder = select_encoder(requested_encoder, decision.backend)
+    output_stream = output_container.add_stream(encoder, rate=rate)
     output_stream.width = LIVE_WIDTH
     output_stream.height = LIVE_HEIGHT
     output_stream.pix_fmt = "yuv420p"
-    output_stream.options = {"crf": "20", "preset": "medium"}
+    if encoder == "h264_nvenc":
+        output_stream.options = {"preset": "p4", "rc": "vbr", "cq": "20", "b": "0"}
+    else:
+        output_stream.options = {"crf": "20", "preset": "medium"}
 
     declared = rgb_from_hex(key_hex)
     sampled: np.ndarray | None = None
@@ -330,7 +392,7 @@ def process_video(source: Path, output: Path, key_hex: str, background: Image.Im
             rgb = frame.to_ndarray(format="rgb24")
             if sampled is None:
                 sampled, inner, outer = tune_key(rgb, declared)
-            rgba = matte_rgba(rgb, sampled, inner, outer)
+            rgba = scheduler.run_matte(decision, rgb, sampled, inner, outer, matte_rgba)
             elapsed = frame_count / fps
             remaining = max(0.0, duration - ((frame_count + 1) / fps)) if duration else FADE_SECONDS
             fade = min(1.0, elapsed / FADE_SECONDS, remaining / FADE_SECONDS)
@@ -353,6 +415,10 @@ def process_video(source: Path, output: Path, key_hex: str, background: Image.Im
     os.replace(temporary, output)
     return {
         "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "backend": decision.backend,
+        "gpu_utilization": decision.gpu_utilization,
+        "backend_reason": decision.reason,
+        "encoder": encoder,
         "sampled_key_rgb": [round(float(value), 2) for value in sampled],
         "key_inner": round(inner, 2),
         "key_outer": round(outer, 2),
@@ -485,6 +551,21 @@ def main() -> int:
         sys.stderr.reconfigure(errors="replace")
     args = parse_args()
     selected_rows = parse_rows(args.rows)
+    if not 0 <= args.gpu_util_threshold <= 100:
+        raise ValueError("--gpu-util-threshold must be between 0 and 100")
+    scheduler = MattingScheduler(
+        device=args.device,
+        gpu_index=args.gpu_index,
+        util_threshold=args.gpu_util_threshold,
+    )
+    startup_diagnostics = scheduler.diagnostics()
+    print(
+        "Matting scheduler: "
+        f"requested={args.device} selected={startup_diagnostics['selected_backend']} "
+        f"gpu={startup_diagnostics['gpu_name'] or 'unavailable'} "
+        f"util={startup_diagnostics['gpu_utilization']}% "
+        f"reason={startup_diagnostics['reason']}"
+    )
     if not INDEX_PATH.is_file():
         raise FileNotFoundError(INDEX_PATH)
     if not BG_PATH.is_file():
@@ -526,7 +607,27 @@ def main() -> int:
             result["icon"] = inspect_existing_icon(icon_path)
         else:
             try:
-                result["icon"] = {"status": "succeeded", "reused": False, **process_icon(image_path, icon_path, record["key_color_hex"])}
+                icon_decision = scheduler.decide()
+                try:
+                    icon_details = process_icon(
+                        image_path,
+                        icon_path,
+                        record["key_color_hex"],
+                        scheduler,
+                        icon_decision,
+                    )
+                except CudaMattingError as exc:
+                    scheduler.disable_cuda(str(exc))
+                    print(f"[{row:03d}] CUDA icon failed; retrying on CPU: {exc}", file=sys.stderr)
+                    icon_decision = scheduler.decide()
+                    icon_details = process_icon(
+                        image_path,
+                        icon_path,
+                        record["key_color_hex"],
+                        scheduler,
+                        icon_decision,
+                    )
+                result["icon"] = {"status": "succeeded", "reused": False, **icon_details}
             except Exception as exc:
                 result["icon"] = {"status": "failed"}
                 result["errors"]["icon"] = str(exc)
@@ -537,7 +638,33 @@ def main() -> int:
             result["video"] = inspect_existing_video(preview_path)
         else:
             try:
-                result["video"] = {"status": "succeeded", "reused": False, **process_video(video_path, preview_path, record["key_color_hex"], background)}
+                video_decision = scheduler.decide()
+                try:
+                    video_details = process_video(
+                        video_path,
+                        preview_path,
+                        record["key_color_hex"],
+                        background,
+                        scheduler,
+                        video_decision,
+                        args.encoder,
+                    )
+                except Exception as exc:
+                    if video_decision.backend != "cuda":
+                        raise
+                    scheduler.disable_cuda(str(exc))
+                    print(f"[{row:03d}] CUDA/NVENC video failed; retrying on CPU/libx264: {exc}", file=sys.stderr)
+                    video_decision = scheduler.decide()
+                    video_details = process_video(
+                        video_path,
+                        preview_path,
+                        record["key_color_hex"],
+                        background,
+                        scheduler,
+                        video_decision,
+                        "libx264",
+                    )
+                result["video"] = {"status": "succeeded", "reused": False, **video_details}
             except Exception as exc:
                 preview_path.unlink(missing_ok=True)
                 result["video"] = {"status": "failed"}
@@ -554,6 +681,7 @@ def main() -> int:
                 "schema_version": 1,
                 "status": "running",
                 "background": rel(BG_PATH),
+                "scheduler": scheduler.diagnostics(),
                 "items": results,
             },
         )
@@ -564,6 +692,7 @@ def main() -> int:
         "status": "succeeded" if results and succeeded == len(results) else "partial",
         "design_prototype": True,
         "background": rel(BG_PATH),
+        "scheduler": scheduler.diagnostics(),
         "icon_spec": {"width": ICON_SIZE, "height": ICON_SIZE, "content_max": ICON_CONTENT_SIZE, "anchor": "bottom_center"},
         "video_spec": {"width": LIVE_WIDTH, "height": LIVE_HEIGHT, "codec": "h264", "pixel_format": "yuv420p", "fade_seconds": FADE_SECONDS, "slot": {"x": LIVE_SLOT_X, "y": LIVE_SLOT_Y}},
         "items": results,

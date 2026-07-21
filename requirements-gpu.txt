@@ -1,0 +1,2 @@
+-r requirements-demo.txt
+cupy-cuda12x[ctk]==14.1.1
