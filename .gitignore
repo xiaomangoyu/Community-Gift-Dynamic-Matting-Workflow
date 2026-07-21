@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Pak20 source package and proprietary visual assets
+/assets/
+/workflow_viewer_assets/
+/index.html
+/workflow.html
+
+# Generated demo outputs
+/matting_demo.html
+/matting_demo_manifest.json
+
+# Local package notes superseded by README.md
+/README_*.txt
+
