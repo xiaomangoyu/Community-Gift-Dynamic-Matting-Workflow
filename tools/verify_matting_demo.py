@@ -14,6 +14,8 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_PREVIEW_SECONDS = 3.0
+EXPECTED_SUBJECT_Y_OFFSET_PX = 78
+EXPECTED_SUBJECT_Y_OFFSET_RATIO = 0.10
 
 
 def sha256_file(path: Path) -> str:
@@ -71,7 +73,12 @@ def main() -> int:
                 errors.append(f"row {row:03d}: icon corners are not transparent")
         source_duration, source_fps, source_frames, _, _ = duration_and_frames(video)
         out_duration, out_fps, out_frames, out_width, out_height = duration_and_frames(preview)
-        arm_cap = item.get("video", {}).get("arm_cap_mask") or {}
+        video_meta = item.get("video", {})
+        arm_cap = video_meta.get("arm_cap_mask") or {}
+        if int(video_meta.get("subject_y_offset_px", -1)) != EXPECTED_SUBJECT_Y_OFFSET_PX:
+            errors.append(f"row {row:03d}: subject vertical offset is not 78 px")
+        if abs(float(video_meta.get("subject_y_offset_ratio", -1)) - EXPECTED_SUBJECT_Y_OFFSET_RATIO) > 1e-6:
+            errors.append(f"row {row:03d}: subject vertical offset ratio is not 10%")
         if not all(
             int(arm_cap.get(field, 0)) > 0
             for field in (
@@ -85,6 +92,8 @@ def main() -> int:
             )
         ):
             errors.append(f"row {row:03d}: missing or invalid arm cap mask")
+        elif int(arm_cap["center_y"]) + int(arm_cap["radius"]) >= 780:
+            errors.append(f"row {row:03d}: shifted arm cap extends outside the 780px slot")
         if (out_width, out_height) != (780, 1688):
             errors.append(f"row {row:03d}: preview is {out_width}x{out_height}")
         expected_duration = min(EXPECTED_PREVIEW_SECONDS, source_duration)

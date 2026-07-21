@@ -46,6 +46,8 @@ LIVE_SLOT_Y = 908
 FADE_SECONDS = 0.3
 PREVIEW_DURATION_SECONDS = 3.0
 LIVE_SUBJECT_SCALE = 0.672
+LIVE_SUBJECT_Y_OFFSET_RATIO = 0.10
+LIVE_SUBJECT_Y_OFFSET_PX = round(ICON_SIZE * LIVE_SUBJECT_Y_OFFSET_RATIO)
 ARM_CAP_START_RATIO = 0.72
 ARM_CAP_RADIUS_RATIO = 0.29
 ARM_CAP_FEATHER_PX = 60
@@ -343,6 +345,12 @@ def fit_rgba(image: Image.Image, size: tuple[int, int], content_scale: float = 1
     return canvas
 
 
+def offset_rgba(image: Image.Image, *, x: int = 0, y: int = 0) -> Image.Image:
+    canvas = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    canvas.alpha_composite(image, (x, y))
+    return canvas
+
+
 def build_arm_cap_mask(alpha: np.ndarray) -> dict[str, int]:
     """Build a fixed lower-arm semicircle from the first unfaded matte.
 
@@ -475,6 +483,7 @@ def process_video(
                 (ICON_SIZE, ICON_SIZE),
                 content_scale=LIVE_SUBJECT_SCALE,
             )
+            layer = offset_rgba(layer, y=LIVE_SUBJECT_Y_OFFSET_PX)
             if arm_cap_mask is None:
                 arm_cap_mask = build_arm_cap_mask(np.asarray(layer.getchannel("A")))
             layer = apply_arm_cap_mask(layer, arm_cap_mask)
@@ -511,6 +520,8 @@ def process_video(
         "clip_start_seconds": 0.0,
         "clip_target_seconds": PREVIEW_DURATION_SECONDS,
         "subject_scale": LIVE_SUBJECT_SCALE,
+        "subject_y_offset_px": LIVE_SUBJECT_Y_OFFSET_PX,
+        "subject_y_offset_ratio": LIVE_SUBJECT_Y_OFFSET_RATIO,
         "arm_cap_mask": arm_cap_mask,
         "dimensions": {"width": LIVE_WIDTH, "height": LIVE_HEIGHT},
         "codec": "h264",
@@ -790,6 +801,8 @@ def main() -> int:
             "clip_duration_seconds": PREVIEW_DURATION_SECONDS,
             "fade_seconds": FADE_SECONDS,
             "subject_scale": LIVE_SUBJECT_SCALE,
+            "subject_y_offset_px": LIVE_SUBJECT_Y_OFFSET_PX,
+            "subject_y_offset_ratio": LIVE_SUBJECT_Y_OFFSET_RATIO,
             "arm_cap_mask": {
                 "enabled": True,
                 "start_ratio": ARM_CAP_START_RATIO,
