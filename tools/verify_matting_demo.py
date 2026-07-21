@@ -71,6 +71,9 @@ def main() -> int:
                 errors.append(f"row {row:03d}: icon corners are not transparent")
         source_duration, source_fps, source_frames, _, _ = duration_and_frames(video)
         out_duration, out_fps, out_frames, out_width, out_height = duration_and_frames(preview)
+        arm_cap = item.get("video", {}).get("arm_cap_mask") or {}
+        if not all(int(arm_cap.get(field, 0)) > 0 for field in ("center_x", "center_y", "radius", "feather_px", "vertical_feather_px")):
+            errors.append(f"row {row:03d}: missing or invalid arm cap mask")
         if (out_width, out_height) != (780, 1688):
             errors.append(f"row {row:03d}: preview is {out_width}x{out_height}")
         expected_duration = min(EXPECTED_PREVIEW_SECONDS, source_duration)

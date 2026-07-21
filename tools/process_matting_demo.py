@@ -46,6 +46,10 @@ LIVE_SLOT_Y = 908
 FADE_SECONDS = 0.3
 PREVIEW_DURATION_SECONDS = 3.0
 LIVE_SUBJECT_SCALE = 0.672
+ARM_CAP_START_RATIO = 0.78
+ARM_CAP_RADIUS_RATIO = 0.23
+ARM_CAP_FEATHER_PX = 10
+ARM_CAP_VERTICAL_FEATHER_PX = 24
 
 
 def parse_args() -> argparse.Namespace:
@@ -337,6 +341,49 @@ def fit_rgba(image: Image.Image, size: tuple[int, int], content_scale: float = 1
     return canvas
 
 
+def build_arm_cap_mask(alpha: np.ndarray) -> dict[str, int]:
+    """Build a fixed lower-arm semicircle from the first unfaded matte.
+
+    Everything above center_y is untouched.  Below it, alpha is kept inside a
+    downward-facing semicircle so the source frame's straight arm crop becomes
+    a soft rounded cap.  The geometry remains fixed for the whole clip to avoid
+    frame-to-frame jitter.
+    """
+    ys, xs = np.where(alpha > 16)
+    if not len(xs):
+        raise ValueError("cannot build arm cap from empty alpha")
+    top, bottom = int(ys.min()), int(ys.max())
+    height = max(1, bottom - top)
+    center_y = int(round(top + height * ARM_CAP_START_RATIO))
+    lower_xs = xs[ys >= center_y]
+    center_x = int(round(float(np.median(lower_xs)))) if len(lower_xs) else int(round(float(np.median(xs))))
+    radius = max(48, int(round(height * ARM_CAP_RADIUS_RATIO)))
+    return {
+        "center_x": center_x,
+        "center_y": center_y,
+        "radius": radius,
+        "feather_px": ARM_CAP_FEATHER_PX,
+        "vertical_feather_px": ARM_CAP_VERTICAL_FEATHER_PX,
+    }
+
+
+def apply_arm_cap_mask(image: Image.Image, mask: dict[str, int]) -> Image.Image:
+    rgba = np.asarray(image, dtype=np.uint8).copy()
+    alpha = rgba[:, :, 3].astype(np.float32)
+    yy, xx = np.ogrid[:alpha.shape[0], :alpha.shape[1]]
+    center_x = mask["center_x"]
+    center_y = mask["center_y"]
+    radius = float(mask["radius"])
+    feather = max(1.0, float(mask["feather_px"]))
+    vertical_feather = max(1.0, float(mask["vertical_feather_px"]))
+    distance = np.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
+    semicircle = np.clip((radius + feather * 0.5 - distance) / feather, 0.0, 1.0)
+    transition = np.clip((yy - center_y) / vertical_feather, 0.0, 1.0)
+    keep = 1.0 - transition * (1.0 - semicircle)
+    rgba[:, :, 3] = np.round(alpha * keep).astype(np.uint8)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
 def video_duration_seconds(container: av.container.InputContainer, stream: av.video.stream.VideoStream) -> float:
     if stream.duration is not None and stream.time_base is not None:
         return float(stream.duration * stream.time_base)
@@ -393,6 +440,7 @@ def process_video(
 
     declared = rgb_from_hex(key_hex)
     sampled: np.ndarray | None = None
+    arm_cap_mask: dict[str, int] | None = None
     inner = outer = 0.0
     frame_count = 0
     try:
@@ -406,12 +454,16 @@ def process_video(
             elapsed = frame_count / fps
             remaining = max(0.0, clip_duration - ((frame_count + 1) / fps))
             fade = min(1.0, elapsed / FADE_SECONDS, remaining / FADE_SECONDS)
-            rgba[:, :, 3] = np.round(rgba[:, :, 3].astype(np.float32) * max(0.0, fade)).astype(np.uint8)
             layer = fit_rgba(
                 Image.fromarray(rgba, mode="RGBA"),
                 (ICON_SIZE, ICON_SIZE),
                 content_scale=LIVE_SUBJECT_SCALE,
             )
+            if arm_cap_mask is None:
+                arm_cap_mask = build_arm_cap_mask(np.asarray(layer.getchannel("A")))
+            layer = apply_arm_cap_mask(layer, arm_cap_mask)
+            layer_alpha = np.asarray(layer.getchannel("A"), dtype=np.float32)
+            layer.putalpha(Image.fromarray(np.round(layer_alpha * max(0.0, fade)).astype(np.uint8), mode="L"))
             composite = background.copy()
             composite.alpha_composite(layer, (LIVE_SLOT_X, LIVE_SLOT_Y))
             output_frame = av.VideoFrame.from_ndarray(np.asarray(composite.convert("RGB")), format="rgb24")
@@ -443,6 +495,7 @@ def process_video(
         "clip_start_seconds": 0.0,
         "clip_target_seconds": PREVIEW_DURATION_SECONDS,
         "subject_scale": LIVE_SUBJECT_SCALE,
+        "arm_cap_mask": arm_cap_mask,
         "dimensions": {"width": LIVE_WIDTH, "height": LIVE_HEIGHT},
         "codec": "h264",
         "pixel_format": "yuv420p",
@@ -721,6 +774,13 @@ def main() -> int:
             "clip_duration_seconds": PREVIEW_DURATION_SECONDS,
             "fade_seconds": FADE_SECONDS,
             "subject_scale": LIVE_SUBJECT_SCALE,
+            "arm_cap_mask": {
+                "enabled": True,
+                "start_ratio": ARM_CAP_START_RATIO,
+                "radius_ratio": ARM_CAP_RADIUS_RATIO,
+                "feather_px": ARM_CAP_FEATHER_PX,
+                "vertical_feather_px": ARM_CAP_VERTICAL_FEATHER_PX,
+            },
             "slot": {"x": LIVE_SLOT_X, "y": LIVE_SLOT_Y},
         },
         "items": results,
