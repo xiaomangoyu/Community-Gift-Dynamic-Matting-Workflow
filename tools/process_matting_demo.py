@@ -46,10 +46,12 @@ LIVE_SLOT_Y = 908
 FADE_SECONDS = 0.3
 PREVIEW_DURATION_SECONDS = 3.0
 LIVE_SUBJECT_SCALE = 0.672
-ARM_CAP_START_RATIO = 0.78
-ARM_CAP_RADIUS_RATIO = 0.23
-ARM_CAP_FEATHER_PX = 10
-ARM_CAP_VERTICAL_FEATHER_PX = 24
+ARM_CAP_START_RATIO = 0.72
+ARM_CAP_RADIUS_RATIO = 0.29
+ARM_CAP_FEATHER_PX = 20
+ARM_CAP_VERTICAL_FEATHER_PX = 48
+ARM_CAP_LEFT_PROTECT_RATIO = 0.55
+ARM_CAP_LEFT_FEATHER_PX = 24
 
 
 def parse_args() -> argparse.Namespace:
@@ -358,12 +360,15 @@ def build_arm_cap_mask(alpha: np.ndarray) -> dict[str, int]:
     lower_xs = xs[ys >= center_y]
     center_x = int(round(float(np.median(lower_xs)))) if len(lower_xs) else int(round(float(np.median(xs))))
     radius = max(48, int(round(height * ARM_CAP_RADIUS_RATIO)))
+    protect_left_until_x = center_x - int(round(radius * ARM_CAP_LEFT_PROTECT_RATIO))
     return {
         "center_x": center_x,
         "center_y": center_y,
         "radius": radius,
         "feather_px": ARM_CAP_FEATHER_PX,
         "vertical_feather_px": ARM_CAP_VERTICAL_FEATHER_PX,
+        "protect_left_until_x": protect_left_until_x,
+        "left_feather_px": ARM_CAP_LEFT_FEATHER_PX,
     }
 
 
@@ -376,10 +381,13 @@ def apply_arm_cap_mask(image: Image.Image, mask: dict[str, int]) -> Image.Image:
     radius = float(mask["radius"])
     feather = max(1.0, float(mask["feather_px"]))
     vertical_feather = max(1.0, float(mask["vertical_feather_px"]))
+    protect_left_until_x = float(mask["protect_left_until_x"])
+    left_feather = max(1.0, float(mask["left_feather_px"]))
     distance = np.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
     semicircle = np.clip((radius + feather * 0.5 - distance) / feather, 0.0, 1.0)
     transition = np.clip((yy - center_y) / vertical_feather, 0.0, 1.0)
-    keep = 1.0 - transition * (1.0 - semicircle)
+    left_transition = np.clip((xx - protect_left_until_x) / left_feather, 0.0, 1.0)
+    keep = 1.0 - transition * left_transition * (1.0 - semicircle)
     rgba[:, :, 3] = np.round(alpha * keep).astype(np.uint8)
     return Image.fromarray(rgba, mode="RGBA")
 
@@ -780,6 +788,8 @@ def main() -> int:
                 "radius_ratio": ARM_CAP_RADIUS_RATIO,
                 "feather_px": ARM_CAP_FEATHER_PX,
                 "vertical_feather_px": ARM_CAP_VERTICAL_FEATHER_PX,
+                "left_protect_ratio": ARM_CAP_LEFT_PROTECT_RATIO,
+                "left_feather_px": ARM_CAP_LEFT_FEATHER_PX,
             },
             "slot": {"x": LIVE_SLOT_X, "y": LIVE_SLOT_Y},
         },
