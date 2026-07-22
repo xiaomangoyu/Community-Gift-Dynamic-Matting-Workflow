@@ -1,2 +1,2 @@
--r requirements-demo.txt
+-r requirements.txt
 cupy-cuda12x[ctk]==14.1.1

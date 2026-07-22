@@ -1,4 +1,4 @@
-"""Print the CUDA scheduler decision without requiring a Pak20 asset package."""
+"""Print the CUDA scheduler decision without requiring media inputs."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from gpu_scheduler import MattingScheduler
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Check CUDA availability for the matting demo.")
+    parser = argparse.ArgumentParser(description="Check CUDA availability for matting.")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--gpu-util-threshold", type=int, default=50)
@@ -26,4 +26,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

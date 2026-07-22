@@ -9,19 +9,19 @@ if not exist ".venv\Scripts\python.exe" (
   if errorlevel 1 goto :python_error
 )
 
-echo Installing or checking demo dependencies...
-".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements-demo.txt
+echo Installing or checking matting dependencies...
+".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 goto :dependency_error
 
 echo.
-echo Processing Pak20 images and videos. This may take several minutes.
-".venv\Scripts\python.exe" tools\process_matting_demo.py %*
+echo Processing images and videos. This may take several minutes.
+".venv\Scripts\python.exe" tools\process_matting.py %*
 set "RESULT=%ERRORLEVEL%"
 echo.
 if "%RESULT%"=="0" (
-  echo Matting demo completed successfully.
+  echo Matting completed successfully.
 ) else (
-  echo Matting demo completed with one or more failures. Check matting_demo_manifest.json.
+  echo Matting completed with one or more failures. Check matting_outputs\manifest.json.
 )
 pause
 exit /b %RESULT%

@@ -1,4 +1,4 @@
-"""Creative Agent-style CUDA scheduling for the chroma-key demo.
+"""CUDA scheduling for the chroma-key processing pipeline.
 
 The scheduler makes one preflight decision per asset.  A healthy, idle NVIDIA
 GPU uses the CuPy path; a missing/busy GPU uses CPU.  The first CUDA exception

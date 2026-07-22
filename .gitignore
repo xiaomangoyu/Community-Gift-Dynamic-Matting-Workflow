@@ -2,16 +2,14 @@
 __pycache__/
 *.py[cod]
 
-# Pak20 source package and proprietary visual assets
+# Deployment-provided media and post-processing templates
 /assets/
-/workflow_viewer_assets/
-/index.html
-/workflow.html
-
-# Generated demo outputs
-/matting_demo.html
-/matting_demo_manifest.json
-
-# Local package notes superseded by README.md
+/inputs/
+/matting_input.json
+/*.html
 /README_*.txt
+/workflow_*/
+/*_manifest.json
 
+# Generated outputs
+/matting_outputs/

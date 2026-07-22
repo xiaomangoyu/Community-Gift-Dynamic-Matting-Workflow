@@ -9,7 +9,7 @@ if not exist ".venv\Scripts\python.exe" (
   if errorlevel 1 goto :python_error
 )
 
-echo Installing or checking CUDA demo dependencies...
+echo Installing or checking CUDA matting dependencies...
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements-gpu.txt
 if errorlevel 1 goto :dependency_error
 
@@ -19,14 +19,14 @@ echo Checking NVIDIA CUDA backend...
 if errorlevel 1 echo CUDA is unavailable. Processing will safely fall back to CPU.
 
 echo.
-echo Processing Pak20 images and videos with GPU-first scheduling...
-".venv\Scripts\python.exe" tools\process_matting_demo.py --device auto --encoder auto %*
+echo Processing images and videos with GPU-first scheduling...
+".venv\Scripts\python.exe" tools\process_matting.py --device auto --encoder auto %*
 set "RESULT=%ERRORLEVEL%"
 echo.
 if "%RESULT%"=="0" (
-  echo Matting demo completed successfully.
+  echo Matting completed successfully.
 ) else (
-  echo Matting demo completed with one or more failures. Check matting_demo_manifest.json.
+  echo Matting completed with one or more failures. Check matting_outputs\manifest.json.
 )
 pause
 exit /b %RESULT%
@@ -40,4 +40,3 @@ exit /b 2
 echo CUDA dependency installation failed. Check the network connection and try again.
 pause
 exit /b 2
-

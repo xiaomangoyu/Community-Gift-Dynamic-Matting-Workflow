@@ -1,8 +1,8 @@
-"""Build the Pak20 Windows matting design demo.
+"""Generic image/video chroma-key matting and post-processing pipeline.
 
-This is deliberately a lightweight chroma-key preview pipeline.  It reads the
-portable viewer's embedded workflow-data, never calls a model API, and never
-overwrites the source images or videos.
+The pipeline consumes a standalone JSON manifest, writes media outputs plus a
+machine-readable result manifest, and never owns or generates a presentation
+layer. Source images and videos are never overwritten.
 """
 
 from __future__ import annotations
@@ -28,17 +28,16 @@ from gpu_scheduler import BackendDecision, CudaMattingError, MattingScheduler
 
 
 ROOT = Path(__file__).resolve().parents[1]
-INDEX_PATH = ROOT / "index.html"
+INPUT_MANIFEST_PATH = ROOT / "matting_input.json"
 BG_PATH = ROOT / "assets" / "BG71-1000.png"
 GIFT_PANEL_TEMPLATE_PATH = ROOT / "assets" / "gift_panel_template.png"
 GIFT_PANEL_COIN_PATH = ROOT / "assets" / "coin_icon.png"
 GIFT_PANEL_FONT_PATH = ROOT / "assets" / "TikTokSans-Medium.ttf"
-OUTPUT_ROOT = ROOT / "workflow_viewer_assets" / "matting_demo"
+OUTPUT_ROOT = ROOT / "matting_outputs"
 ICON_DIR = OUTPUT_ROOT / "icons"
 GIFT_PANEL_DIR = OUTPUT_ROOT / "gift_panels"
-VIDEO_DIR = OUTPUT_ROOT / "video_previews"
-MANIFEST_PATH = ROOT / "matting_demo_manifest.json"
-VIEWER_PATH = ROOT / "matting_demo.html"
+VIDEO_DIR = OUTPUT_ROOT / "videos"
+MANIFEST_PATH = OUTPUT_ROOT / "manifest.json"
 
 ICON_SIZE = 780
 ICON_CONTENT_SIZE = 720
@@ -61,7 +60,7 @@ LIVE_HEIGHT = 1688
 LIVE_SLOT_X = 0
 LIVE_SLOT_Y = 908
 FADE_SECONDS = 0.3
-PREVIEW_DURATION_SECONDS = 3.0
+OUTPUT_DURATION_SECONDS = 3.0
 LIVE_SUBJECT_SCALE = 0.672
 LIVE_SUBJECT_Y_OFFSET_RATIO = 0.10
 LIVE_SUBJECT_Y_OFFSET_PX = round(ICON_SIZE * LIVE_SUBJECT_Y_OFFSET_RATIO)
@@ -71,12 +70,25 @@ ARM_CAP_FEATHER_PX = 60
 ARM_CAP_VERTICAL_FEATHER_PX = 96
 ARM_CAP_LEFT_PROTECT_RATIO = 0.55
 ARM_CAP_LEFT_FEATHER_PX = 48
+PIPELINE_VERSION = "generic-matting-v1"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate the Pak20 matting design demo.")
+    parser = argparse.ArgumentParser(description="Run generic chroma-key matting and post-processing.")
+    parser.add_argument(
+        "--input-manifest",
+        type=Path,
+        default=INPUT_MANIFEST_PATH,
+        help="Standalone JSON input manifest. Relative media paths resolve from its directory.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=OUTPUT_ROOT,
+        help="Directory for processed media and manifest.json.",
+    )
     parser.add_argument("--force", action="store_true", help="Regenerate existing outputs.")
-    parser.add_argument("--rows", default="", help="Optional rows such as 1-3,8.")
+    parser.add_argument("--items", default="", help="Optional comma-separated item IDs.")
     parser.add_argument("--icons-only", action="store_true", help="Skip video processing.")
     parser.add_argument(
         "--device",
@@ -105,71 +117,47 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_rows(value: str) -> set[int] | None:
+def parse_item_ids(value: str) -> set[str] | None:
     value = value.strip()
     if not value:
         return None
-    rows: set[int] = set()
-    for token in value.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        if "-" in token:
-            start_text, end_text = token.split("-", 1)
-            start, end = int(start_text), int(end_text)
-            if start > end:
-                raise ValueError(f"invalid row range: {token}")
-            rows.update(range(start, end + 1))
-        else:
-            rows.add(int(token))
-    return rows
+    return {token.strip() for token in value.split(",") if token.strip()}
 
 
-def load_workflow_items() -> list[dict[str, Any]]:
-    html = INDEX_PATH.read_text(encoding="utf-8")
-    match = re.search(
-        r'<script id="workflow-data" type="application/json">(.*?)</script>',
-        html,
-        flags=re.DOTALL,
-    )
-    if not match:
-        raise ValueError(f"workflow-data was not found in {INDEX_PATH}")
-    data = json.loads(match.group(1))
+def load_input_items(path: Path) -> list[dict[str, Any]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
     items = data.get("items") or []
     if not isinstance(items, list):
-        raise ValueError("workflow-data.items must be a list")
-    return sorted(items, key=lambda item: int(item.get("row_id") or 0))
+        raise ValueError("input manifest items must be a list")
+    return items
 
 
-def safe_asset_path(relative: str) -> Path:
-    relative_path = Path(str(relative or ""))
-    if not relative or relative_path.is_absolute() or ".." in relative_path.parts:
-        raise ValueError(f"unsafe or empty asset path: {relative!r}")
-    result = (ROOT / relative_path).resolve()
-    if ROOT.resolve() not in result.parents:
-        raise ValueError(f"asset escapes the demo root: {relative!r}")
-    return result
+def resolve_media_path(value: str, manifest_dir: Path) -> Path:
+    path = Path(str(value or ""))
+    if not value:
+        raise ValueError("media path is empty")
+    return path.resolve() if path.is_absolute() else (manifest_dir / path).resolve()
 
 
-def source_record(item: dict[str, Any]) -> dict[str, Any]:
-    outputs = item.get("outputs") or {}
-    handheld = outputs.get("handheld") or outputs.get("clean") or {}
-    video = item.get("video") or {}
-    chroma = (item.get("handheld") or {}).get("chroma_screen") or video.get("chroma_screen") or {}
-    image_asset = str(handheld.get("asset") or "")
-    video_asset = str(video.get("asset") or "")
+def source_record(item: dict[str, Any], index: int) -> dict[str, Any]:
+    item_id = str(item.get("id") or f"item-{index:03d}").strip()
+    if not item_id:
+        raise ValueError("item id is empty")
+    file_id = re.sub(r"[^A-Za-z0-9._-]+", "-", item_id).strip("-._")
+    if not file_id:
+        raise ValueError(f"item id cannot form a safe filename: {item_id!r}")
+    image_asset = str(item.get("image") or "")
+    video_asset = str(item.get("video") or "")
     if not image_asset:
-        raise ValueError("mainline image asset is missing")
+        raise ValueError("image is missing")
     if not video_asset:
-        raise ValueError("mainline video asset is missing")
-    key_hex = str(chroma.get("key_color_hex") or "#00FF00").upper()
+        raise ValueError("video is missing")
+    key_hex = str(item.get("key_color_hex") or "#00FF00").upper()
     if not re.fullmatch(r"#[0-9A-F]{6}", key_hex):
         raise ValueError(f"invalid key color: {key_hex!r}")
     return {
-        "row_id": int(item.get("row_id") or 0),
-        "anchor_id": str(item.get("anchor_id") or ""),
-        "host_name": str(item.get("host_name") or ""),
-        "community_name": str(item.get("community_name") or ""),
+        "id": item_id,
+        "file_id": file_id,
         "key_color_hex": key_hex,
         "input_image": image_asset,
         "input_video": video_asset,
@@ -573,7 +561,7 @@ def process_video(
     rate = input_stream.average_rate or Fraction(24, 1)
     fps = float(rate)
     duration = video_duration_seconds(input_container, input_stream)
-    clip_duration = min(PREVIEW_DURATION_SECONDS, duration) if duration > 0 else PREVIEW_DURATION_SECONDS
+    clip_duration = min(OUTPUT_DURATION_SECONDS, duration) if duration > 0 else OUTPUT_DURATION_SECONDS
     clip_frame_limit = max(1, round(clip_duration * fps))
     output_container = av.open(str(temporary), mode="w", options={"movflags": "+faststart"})
     encoder = select_encoder(requested_encoder, decision.backend)
@@ -642,7 +630,7 @@ def process_video(
         "duration_seconds": round(frame_count / fps, 3),
         "source_duration_seconds": round(duration, 3),
         "clip_start_seconds": 0.0,
-        "clip_target_seconds": PREVIEW_DURATION_SECONDS,
+        "clip_target_seconds": OUTPUT_DURATION_SECONDS,
         "subject_scale": LIVE_SUBJECT_SCALE,
         "subject_y_offset_px": LIVE_SUBJECT_Y_OFFSET_PX,
         "subject_y_offset_ratio": LIVE_SUBJECT_Y_OFFSET_RATIO,
@@ -662,7 +650,11 @@ def sha256_file(path: Path) -> str:
 
 
 def rel(path: Path) -> str:
-    return path.resolve().relative_to(ROOT.resolve()).as_posix()
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return resolved.as_posix()
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
@@ -677,118 +669,30 @@ def atomic_write_json(path: Path, data: Any) -> None:
         Path(temporary_name).unlink(missing_ok=True)
 
 
-def build_viewer_html(manifest: dict[str, Any]) -> str:
-    embedded = json.dumps(manifest, ensure_ascii=False).replace("<", "\\u003c")
-    return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Matting Preview</title>
-  <style>
-    :root{{--bg:#f5f6f8;--card:#fff;--ink:#171a21;--muted:#697386;--line:#dfe3ea;--accent:#6d45d9;--ok:#18864b;}}
-    *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 Inter,"Segoe UI",Arial,sans-serif}}
-    header{{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:18px;padding:16px 24px;background:rgba(255,255,255,.96);border-bottom:1px solid var(--line);backdrop-filter:blur(12px)}}
-    header h1{{margin:0;font-size:20px}} .spacer{{flex:1}} a,button,select{{font:inherit}} a{{color:var(--accent);text-decoration:none}}
-    button,select{{border:1px solid var(--line);background:#fff;border-radius:9px;padding:8px 11px;color:var(--ink)}} button{{cursor:pointer}} button:hover{{border-color:var(--accent)}}
-    main{{max-width:1480px;margin:auto;padding:22px}} .toolbar{{display:flex;align-items:center;gap:10px;margin-bottom:18px}} .toolbar select{{min-width:280px}}
-    .identity{{padding:16px 18px;background:var(--card);border:1px solid var(--line);border-radius:14px;margin-bottom:18px;display:flex;gap:16px;align-items:center}}
-    .identity h2{{margin:0 0 3px;font-size:18px}} .meta{{color:var(--muted)}} .key{{display:inline-flex;align-items:center;gap:7px;padding:4px 8px;border:1px solid var(--line);border-radius:99px}}
-    .swatch{{width:13px;height:13px;border-radius:50%;box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}}
-    .section-title{{margin:24px 0 10px;font-size:17px}} .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}} .card{{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}}
-    .card h3{{margin:0;padding:13px 15px;border-bottom:1px solid var(--line);font-size:15px}} .media{{min-height:360px;display:flex;align-items:center;justify-content:center;background:#111;overflow:hidden}}
-    .media.checker{{background-color:#fff;background-image:linear-gradient(45deg,#ddd 25%,transparent 25%),linear-gradient(-45deg,#ddd 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#ddd 75%),linear-gradient(-45deg,transparent 75%,#ddd 75%);background-size:28px 28px;background-position:0 0,0 14px,14px -14px,-14px 0}}
-    img,video{{display:block;max-width:100%;max-height:720px;object-fit:contain}} video{{width:100%;background:#111}} .status{{color:var(--ok);font-weight:600}}
-    footer{{padding:22px;color:var(--muted);text-align:center}} @media(max-width:900px){{.grid{{grid-template-columns:1fr}} header{{padding:12px}} main{{padding:12px}} .toolbar{{flex-wrap:wrap}} .toolbar select{{min-width:0;flex:1}}}}
-  </style>
-</head>
-<body>
-  <header>
-    <h1 data-i18n="title">抠图效果预览</h1>
-    <a href="index.html" data-i18n="review">返回结果审核台</a>
-    <a href="workflow.html" data-i18n="workflow">工作流画布</a>
-    <span class="spacer"></span>
-    <button id="languageButton" type="button">English</button>
-  </header>
-  <main>
-    <div class="toolbar">
-      <button id="previousButton" type="button" data-i18n="previous">上一位</button>
-      <select id="rowSelect" aria-label="Creator"></select>
-      <button id="nextButton" type="button" data-i18n="next">下一位</button>
-      <span class="status" id="rowStatus"></span>
-    </div>
-    <section class="identity">
-      <div><h2 id="hostName"></h2><div class="meta" id="communityName"></div></div>
-      <span class="spacer"></span>
-      <span class="key"><i class="swatch" id="keySwatch"></i><span id="keyText"></span></span>
-    </section>
-    <h2 class="section-title" data-i18n="finalMocks">最终展示 Mock</h2>
-    <section class="grid">
-      <article class="card"><h3 data-i18n="giftPanel">送礼物界面 · Gift Panel</h3><div class="media"><img id="giftPanelImage" alt=""></div></article>
-      <article class="card"><h3 data-i18n="panelVideo">礼物送出界面 · BG71 视频</h3><div class="media"><video id="previewVideo" controls muted playsinline preload="metadata"></video></div></article>
-    </section>
-    <h2 class="section-title" data-i18n="processingEvidence">抠图处理证据</h2>
-    <section class="grid">
-      <article class="card"><h3 data-i18n="originalImage">原始幕布图片</h3><div class="media"><img id="originalImage" alt=""></div></article>
-      <article class="card"><h3 data-i18n="transparentIcon">透明 Icon · 780×780</h3><div class="media checker"><img id="iconImage" alt=""></div></article>
-      <article class="card"><h3 data-i18n="originalVideo">原始幕布视频</h3><div class="media"><video id="originalVideo" controls muted playsinline preload="metadata"></video></div></article>
-    </section>
-  </main>
-  <footer data-i18n="footer">Windows 设计验证版 · 色键抠图 · 原素材保持不变</footer>
-  <script id="matting-data" type="application/json">{embedded}</script>
-  <script>
-    const DATA=JSON.parse(document.getElementById('matting-data').textContent); const rows=DATA.items;
-    const TEXT={{zh:{{title:'抠图效果预览',review:'返回结果审核台',workflow:'工作流画布',previous:'上一位',next:'下一位',originalImage:'原始幕布图片',transparentIcon:'透明 Icon · 780×780',originalVideo:'原始幕布视频',panelVideo:'BG71 直播间面板视频',footer:'Seedance 源视频为 5 秒 · 面板预览取首帧开始的前 3 秒 · 原素材保持不变',success:'处理成功',failed:'处理失败',row:'第'}},en:{{title:'Matting Preview',review:'Back to Review',workflow:'Workflow Canvas',previous:'Previous',next:'Next',originalImage:'Original Chroma Image',transparentIcon:'Transparent Icon · 780×780',originalVideo:'Original Chroma Video',panelVideo:'BG71 Live Panel Video',footer:'Seedance source: 5s · Panel preview: first 3s from frame 0 · Original assets preserved',success:'Processed',failed:'Processing Failed',row:'Row'}}}};
-    Object.assign(TEXT.zh,{{title:'礼物双场景 Mock 预览',finalMocks:'最终展示 Mock',processingEvidence:'抠图处理证据',giftPanel:'送礼物界面 · Gift Panel',panelVideo:'礼物送出界面 · BG71 视频',footer:'送礼面板使用透明 Icon · 送出视频取 Seedance 首帧开始的前 3 秒 · 原素材保持不变'}});
-    Object.assign(TEXT.en,{{title:'Gift Experience Mock Preview',finalMocks:'Final Experience Mocks',processingEvidence:'Matting Evidence',giftPanel:'Gift Selection Screen · Gift Panel',panelVideo:'Gift Sent Screen · BG71 Video',footer:'Gift panel uses the transparent icon · Sent animation uses the first 3 seconds from frame 0 · Original assets preserved'}});
-    let language=localStorage.getItem('mattingDemoLanguage')==='en'?'en':'zh'; let current=0;
-    const $=id=>document.getElementById(id); const rowSelect=$('rowSelect');
-    function applyLanguage(){{document.documentElement.lang=language==='en'?'en':'zh-CN'; document.querySelectorAll('[data-i18n]').forEach(node=>node.textContent=TEXT[language][node.dataset.i18n]); $('languageButton').textContent=language==='zh'?'English':'Chinese'; document.title=TEXT[language].title; renderSelect(); render();}}
-    function renderSelect(){{const value=String(current); rowSelect.innerHTML=rows.map((item,index)=>`<option value="${{index}}">${{TEXT[language].row}} ${{String(item.row_id).padStart(3,'0')}} · ${{escapeHtml(item.host_name||item.anchor_id)}}</option>`).join(''); rowSelect.value=value;}}
-    function escapeHtml(value){{return String(value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]));}}
-    function setVideo(element,source){{element.pause(); element.removeAttribute('src'); if(source)element.src=source; element.load();}}
-    function render(){{if(!rows.length)return; const item=rows[current]; rowSelect.value=String(current); $('hostName').textContent=item.host_name||item.anchor_id; $('communityName').textContent=item.community_name||item.anchor_id; $('keySwatch').style.background=item.key_color_hex; $('keyText').textContent=item.key_color_hex; $('rowStatus').textContent=item.status==='succeeded'?TEXT[language].success:TEXT[language].failed; $('giftPanelImage').src=item.gift_panel_path||''; $('originalImage').src=item.input_image; $('iconImage').src=item.icon_path||''; setVideo($('originalVideo'),item.input_video); setVideo($('previewVideo'),item.preview_video||''); $('previousButton').disabled=current===0; $('nextButton').disabled=current===rows.length-1; history.replaceState(null,'',`?row=${{item.row_id}}`);}}
-    rowSelect.addEventListener('change',()=>{{current=Number(rowSelect.value);render();}}); $('previousButton').addEventListener('click',()=>{{current=Math.max(0,current-1);renderSelect();render();}}); $('nextButton').addEventListener('click',()=>{{current=Math.min(rows.length-1,current+1);renderSelect();render();}}); $('languageButton').addEventListener('click',()=>{{language=language==='zh'?'en':'zh';localStorage.setItem('mattingDemoLanguage',language);applyLanguage();}});
-    const requested=Number(new URLSearchParams(location.search).get('row')); const found=rows.findIndex(item=>item.row_id===requested); if(found>=0)current=found; applyLanguage();
-  </script>
-</body>
-</html>
-"""
-
-
-def inject_home_link() -> None:
-    html = INDEX_PATH.read_text(encoding="utf-8")
-    marker = "matting-demo-entry"
-    if marker in html:
-        return
-    entry = (
-        '<a id="matting-demo-entry" href="matting_demo.html" '
-        'style="position:fixed;right:22px;bottom:22px;z-index:9999;padding:10px 14px;'
-        'border-radius:999px;background:#6d45d9;color:white;text-decoration:none;'
-        'font:600 13px Segoe UI,Arial,sans-serif;box-shadow:0 8px 24px rgba(50,30,100,.28)">'
-        'Matting Preview</a>'
-    )
-    if "</body>" not in html:
-        raise ValueError("index.html does not contain a closing body tag")
-    INDEX_PATH.write_text(html.replace("</body>", entry + "\n</body>", 1), encoding="utf-8")
-
-
 def main() -> int:
+    global OUTPUT_ROOT, ICON_DIR, GIFT_PANEL_DIR, VIDEO_DIR, MANIFEST_PATH
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(errors="replace")
     args = parse_args()
-    selected_rows = parse_rows(args.rows)
-    previous_items: dict[int, dict[str, Any]] = {}
+    input_manifest = args.input_manifest.resolve()
+    OUTPUT_ROOT = args.output_dir.resolve()
+    ICON_DIR = OUTPUT_ROOT / "icons"
+    GIFT_PANEL_DIR = OUTPUT_ROOT / "gift_panels"
+    VIDEO_DIR = OUTPUT_ROOT / "videos"
+    MANIFEST_PATH = OUTPUT_ROOT / "manifest.json"
+    selected_items = parse_item_ids(args.items)
+    previous_items: dict[str, dict[str, Any]] = {}
     if MANIFEST_PATH.is_file():
         try:
             previous_manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-            previous_items = {
-                int(item["row_id"]): item
-                for item in previous_manifest.get("items", [])
-                if item.get("row_id") is not None
-            }
+            if previous_manifest.get("pipeline_version") == PIPELINE_VERSION:
+                previous_items = {
+                    str(item["id"]): item
+                    for item in previous_manifest.get("items", [])
+                    if item.get("id") is not None
+                }
         except (OSError, ValueError, TypeError):
             previous_items = {}
     if not 0 <= args.gpu_util_threshold <= 100:
@@ -806,8 +710,8 @@ def main() -> int:
         f"util={startup_diagnostics['gpu_utilization']}% "
         f"reason={startup_diagnostics['reason']}"
     )
-    if not INDEX_PATH.is_file():
-        raise FileNotFoundError(INDEX_PATH)
+    if not input_manifest.is_file():
+        raise FileNotFoundError(input_manifest)
     if not BG_PATH.is_file():
         raise FileNotFoundError(BG_PATH)
     if not GIFT_PANEL_TEMPLATE_PATH.is_file():
@@ -821,27 +725,32 @@ def main() -> int:
     GIFT_PANEL_DIR.mkdir(parents=True, exist_ok=True)
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any]] = []
-    for item in load_workflow_items():
+    for index, item in enumerate(load_input_items(input_manifest), start=1):
         try:
-            record = source_record(item)
+            record = source_record(item, index)
         except Exception as exc:
-            print(f"[input] skipped malformed row: {exc}", file=sys.stderr)
+            print(f"[input] skipped malformed item: {exc}", file=sys.stderr)
             continue
-        row = record["row_id"]
-        if selected_rows is not None and row not in selected_rows:
+        item_id = record["id"]
+        file_id = record["file_id"]
+        if selected_items is not None and item_id not in selected_items:
             continue
-        image_path = safe_asset_path(record["input_image"])
-        video_path = safe_asset_path(record["input_video"])
-        icon_path = ICON_DIR / f"row{row:03d}_mainline_icon_780.png"
-        gift_panel_path = GIFT_PANEL_DIR / f"row{row:03d}_mainline_gift_panel.png"
-        preview_path = VIDEO_DIR / f"row{row:03d}_mainline_bg71.mp4"
-        print(f"[{row:03d}] {record['host_name']} - processing")
+        image_path = resolve_media_path(record["input_image"], input_manifest.parent)
+        video_path = resolve_media_path(record["input_video"], input_manifest.parent)
+        if not image_path.is_file():
+            raise FileNotFoundError(image_path)
+        if not video_path.is_file():
+            raise FileNotFoundError(video_path)
+        icon_path = ICON_DIR / f"{file_id}_icon_780.png"
+        gift_panel_path = GIFT_PANEL_DIR / f"{file_id}_gift_panel.png"
+        output_video_path = VIDEO_DIR / f"{file_id}_composited.mp4"
+        print(f"[{item_id}] processing")
         result = {
             **record,
             "status": "running",
             "icon_path": rel(icon_path),
             "gift_panel_path": rel(gift_panel_path),
-            "preview_video": "" if args.icons_only else rel(preview_path),
+            "video_path": "" if args.icons_only else rel(output_video_path),
             "input_image_sha256": sha256_file(image_path),
             "input_video_sha256": sha256_file(video_path),
             "icon": {},
@@ -849,7 +758,16 @@ def main() -> int:
             "video": {},
             "errors": {},
         }
-        previous_icon = previous_items.get(row, {}).get("icon") or {}
+        previous_item = previous_items.get(item_id, {})
+        image_is_unchanged = (
+            previous_item.get("input_image_sha256") == result["input_image_sha256"]
+            and previous_item.get("key_color_hex") == result["key_color_hex"]
+        )
+        video_is_unchanged = (
+            previous_item.get("input_video_sha256") == result["input_video_sha256"]
+            and previous_item.get("key_color_hex") == result["key_color_hex"]
+        )
+        previous_icon = previous_item.get("icon") or {}
         previous_icon_mask = previous_icon.get("arm_cap_mask") or {}
         icon_mask_is_current = all(
             int(previous_icon_mask.get(field, 0)) > 0
@@ -863,7 +781,7 @@ def main() -> int:
                 "left_feather_px",
             )
         )
-        if icon_path.is_file() and not args.force and icon_mask_is_current:
+        if icon_path.is_file() and not args.force and image_is_unchanged and icon_mask_is_current:
             result["icon"] = {**previous_icon, "reused": True, "elapsed_seconds": 0.0}
         else:
             try:
@@ -878,7 +796,7 @@ def main() -> int:
                     )
                 except CudaMattingError as exc:
                     scheduler.disable_cuda(str(exc))
-                    print(f"[{row:03d}] CUDA icon failed; retrying on CPU: {exc}", file=sys.stderr)
+                    print(f"[{item_id}] CUDA icon failed; retrying on CPU: {exc}", file=sys.stderr)
                     icon_decision = scheduler.decide()
                     icon_details = process_icon(
                         image_path,
@@ -891,15 +809,15 @@ def main() -> int:
             except Exception as exc:
                 result["icon"] = {"status": "failed"}
                 result["errors"]["icon"] = str(exc)
-                print(f"[{row:03d}] icon failed: {exc}", file=sys.stderr)
+                print(f"[{item_id}] icon failed: {exc}", file=sys.stderr)
         if result["icon"].get("status") != "succeeded":
             result["gift_panel"] = {"status": "skipped"}
         elif (
             gift_panel_path.is_file()
             and not args.force
             and result["icon"].get("reused") is True
-            and int((previous_items.get(row, {}).get("gift_panel") or {}).get("icon_size", 0)) == GIFT_PANEL_ICON_SIZE
-            and (previous_items.get(row, {}).get("gift_panel") or {}).get("gift_name") == GIFT_PANEL_NAME
+            and int((previous_item.get("gift_panel") or {}).get("icon_size", 0)) == GIFT_PANEL_ICON_SIZE
+            and (previous_item.get("gift_panel") or {}).get("gift_name") == GIFT_PANEL_NAME
         ):
             result["gift_panel"] = inspect_existing_gift_panel(gift_panel_path)
         else:
@@ -914,22 +832,22 @@ def main() -> int:
                 gift_panel_path.unlink(missing_ok=True)
                 result["gift_panel"] = {"status": "failed"}
                 result["errors"]["gift_panel"] = str(exc)
-                print(f"[{row:03d}] gift panel failed: {exc}", file=sys.stderr)
+                print(f"[{item_id}] gift panel failed: {exc}", file=sys.stderr)
         if args.icons_only:
             result["video"] = {"status": "skipped"}
-        elif preview_path.is_file() and not args.force:
-            previous_video = previous_items.get(row, {}).get("video") or {}
+        elif output_video_path.is_file() and not args.force and video_is_unchanged:
+            previous_video = previous_item.get("video") or {}
             if previous_video.get("status") == "succeeded":
                 result["video"] = {**previous_video, "reused": True, "elapsed_seconds": 0.0}
             else:
-                result["video"] = inspect_existing_video(preview_path)
+                result["video"] = inspect_existing_video(output_video_path)
         else:
             try:
                 video_decision = scheduler.decide()
                 try:
                     video_details = process_video(
                         video_path,
-                        preview_path,
+                        output_video_path,
                         record["key_color_hex"],
                         background,
                         scheduler,
@@ -940,11 +858,11 @@ def main() -> int:
                     if video_decision.backend != "cuda":
                         raise
                     scheduler.disable_cuda(str(exc))
-                    print(f"[{row:03d}] CUDA/NVENC video failed; retrying on CPU/libx264: {exc}", file=sys.stderr)
+                    print(f"[{item_id}] CUDA/NVENC video failed; retrying on CPU/libx264: {exc}", file=sys.stderr)
                     video_decision = scheduler.decide()
                     video_details = process_video(
                         video_path,
-                        preview_path,
+                        output_video_path,
                         record["key_color_hex"],
                         background,
                         scheduler,
@@ -953,10 +871,10 @@ def main() -> int:
                     )
                 result["video"] = {"status": "succeeded", "reused": False, **video_details}
             except Exception as exc:
-                preview_path.unlink(missing_ok=True)
+                output_video_path.unlink(missing_ok=True)
                 result["video"] = {"status": "failed"}
                 result["errors"]["video"] = str(exc)
-                print(f"[{row:03d}] video failed: {exc}", file=sys.stderr)
+                print(f"[{item_id}] video failed: {exc}", file=sys.stderr)
         required = [result["icon"]["status"], result["gift_panel"]["status"]]
         if not args.icons_only:
             required.append(result["video"]["status"])
@@ -966,7 +884,9 @@ def main() -> int:
             MANIFEST_PATH,
             {
                 "schema_version": 2,
+                "pipeline_version": PIPELINE_VERSION,
                 "status": "running",
+                "input_manifest": str(input_manifest),
                 "background": rel(BG_PATH),
                 "scheduler": scheduler.diagnostics(),
                 "items": results,
@@ -976,8 +896,9 @@ def main() -> int:
     succeeded = sum(item["status"] == "succeeded" for item in results)
     manifest = {
         "schema_version": 2,
+        "pipeline_version": PIPELINE_VERSION,
         "status": "succeeded" if results and succeeded == len(results) else "partial",
-        "design_prototype": True,
+        "input_manifest": str(input_manifest),
         "background": rel(BG_PATH),
         "scheduler": scheduler.diagnostics(),
         "icon_spec": {
@@ -1001,7 +922,7 @@ def main() -> int:
             "template": rel(GIFT_PANEL_TEMPLATE_PATH),
             "slot_center": {"x": GIFT_PANEL_SLOT_CENTER[0], "y": GIFT_PANEL_SLOT_CENTER[1]},
             "icon_size": GIFT_PANEL_ICON_SIZE,
-            "name_source": "fixed_demo_label",
+            "name_source": "fixed_label",
             "gift_name": GIFT_PANEL_NAME,
             "price": GIFT_PANEL_PRICE,
         },
@@ -1011,7 +932,7 @@ def main() -> int:
             "codec": "h264",
             "pixel_format": "yuv420p",
             "clip_start_seconds": 0.0,
-            "clip_duration_seconds": PREVIEW_DURATION_SECONDS,
+            "clip_duration_seconds": OUTPUT_DURATION_SECONDS,
             "fade_seconds": FADE_SECONDS,
             "subject_scale": LIVE_SUBJECT_SCALE,
             "subject_y_offset_px": LIVE_SUBJECT_Y_OFFSET_PX,
@@ -1030,10 +951,7 @@ def main() -> int:
         "items": results,
     }
     atomic_write_json(MANIFEST_PATH, manifest)
-    VIEWER_PATH.write_text(build_viewer_html(manifest), encoding="utf-8")
-    inject_home_link()
     print(f"Manifest: {MANIFEST_PATH}")
-    print(f"Viewer:   {VIEWER_PATH}")
     print(f"Success:  {succeeded}/{len(results)}")
     return 0 if manifest["status"] == "succeeded" else 1
 

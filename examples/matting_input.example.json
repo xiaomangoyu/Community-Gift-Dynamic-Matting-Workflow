@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "items": [
+    {
+      "id": "gift-001",
+      "image": "../inputs/gift-001.png",
+      "video": "../inputs/gift-001.mp4",
+      "key_color_hex": "#00FF00"
+    },
+    {
+      "id": "gift-002",
+      "image": "../inputs/gift-002.png",
+      "video": "../inputs/gift-002.mp4",
+      "key_color_hex": "#FF00FF"
+    }
+  ]
+}
