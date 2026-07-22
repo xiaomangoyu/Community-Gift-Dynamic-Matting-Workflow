@@ -46,6 +46,13 @@ def main() -> int:
     args = parser.parse_args()
     manifest = json.loads((ROOT / "matting_demo_manifest.json").read_text(encoding="utf-8"))
     errors: list[str] = []
+    panel_template_path = ROOT / "assets" / "gift_panel_template.png"
+    panel_template = None
+    if panel_template_path.is_file():
+        with Image.open(panel_template_path) as template_image:
+            panel_template = np.asarray(template_image.convert("RGBA"))
+    else:
+        errors.append("gift panel template is missing")
     items = manifest.get("items") or []
     if len(items) != 20:
         errors.append(f"expected 20 manifest items, got {len(items)}")
@@ -57,11 +64,12 @@ def main() -> int:
         image = ROOT / item["input_image"]
         video = ROOT / item["input_video"]
         icon = ROOT / item["icon_path"]
+        gift_panel = ROOT / item["gift_panel_path"]
         preview = ROOT / item["preview_video"]
-        for path in (image, video, icon, preview):
+        for path in (image, video, icon, gift_panel, preview):
             if not path.is_file() or path.stat().st_size == 0:
                 errors.append(f"row {row:03d}: missing or empty {path.name}")
-        if not icon.is_file() or not preview.is_file():
+        if not icon.is_file() or not gift_panel.is_file() or not preview.is_file():
             continue
         with Image.open(icon) as icon_image:
             if icon_image.size != (780, 780) or icon_image.mode != "RGBA":
@@ -71,6 +79,19 @@ def main() -> int:
                 errors.append(f"row {row:03d}: icon alpha is empty or opaque")
             if any(int(alpha[y, x]) != 0 for x, y in ((0, 0), (779, 0), (0, 779), (779, 779))):
                 errors.append(f"row {row:03d}: icon corners are not transparent")
+        with Image.open(gift_panel) as panel_image:
+            if panel_image.size != (780, 904) or panel_image.mode != "RGBA":
+                errors.append(f"row {row:03d}: invalid gift panel {panel_image.mode} {panel_image.size}")
+            elif panel_template is not None:
+                rendered_panel = np.asarray(panel_image.convert("RGBA"))
+                # Creative Agent's empty gift slot occupies the top-left area.
+                if np.array_equal(rendered_panel[190:390, 35:180], panel_template[190:390, 35:180]):
+                    errors.append(f"row {row:03d}: gift icon was not composited into the panel slot")
+        panel_meta = item.get("gift_panel", {})
+        if panel_meta.get("status") != "succeeded":
+            errors.append(f"row {row:03d}: gift panel did not succeed")
+        if int(panel_meta.get("price", 0)) != 1000:
+            errors.append(f"row {row:03d}: gift panel price is not 1000")
         source_duration, source_fps, source_frames, _, _ = duration_and_frames(video)
         out_duration, out_fps, out_frames, out_width, out_height = duration_and_frames(preview)
         video_meta = item.get("video", {})
@@ -111,6 +132,7 @@ def main() -> int:
         "status": "passed" if not errors else "failed",
         "items": len(items),
         "icons": len(list((ROOT / "workflow_viewer_assets" / "matting_demo" / "icons").glob("*.png"))),
+        "gift_panels": len(list((ROOT / "workflow_viewer_assets" / "matting_demo" / "gift_panels").glob("*.png"))),
         "video_previews": len(list((ROOT / "workflow_viewer_assets" / "matting_demo" / "video_previews").glob("*.mp4"))),
         "key_color_counts": key_counts,
         "source_hash_comparison": bool(args.original_root),

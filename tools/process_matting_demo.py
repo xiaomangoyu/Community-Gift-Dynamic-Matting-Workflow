@@ -22,7 +22,7 @@ from typing import Any
 
 import av
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from gpu_scheduler import BackendDecision, CudaMattingError, MattingScheduler
 
@@ -30,8 +30,12 @@ from gpu_scheduler import BackendDecision, CudaMattingError, MattingScheduler
 ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = ROOT / "index.html"
 BG_PATH = ROOT / "assets" / "BG71-1000.png"
+GIFT_PANEL_TEMPLATE_PATH = ROOT / "assets" / "gift_panel_template.png"
+GIFT_PANEL_COIN_PATH = ROOT / "assets" / "coin_icon.png"
+GIFT_PANEL_FONT_PATH = ROOT / "assets" / "TikTokSans-Medium.ttf"
 OUTPUT_ROOT = ROOT / "workflow_viewer_assets" / "matting_demo"
 ICON_DIR = OUTPUT_ROOT / "icons"
+GIFT_PANEL_DIR = OUTPUT_ROOT / "gift_panels"
 VIDEO_DIR = OUTPUT_ROOT / "video_previews"
 MANIFEST_PATH = ROOT / "matting_demo_manifest.json"
 VIEWER_PATH = ROOT / "matting_demo.html"
@@ -39,6 +43,17 @@ VIEWER_PATH = ROOT / "matting_demo.html"
 ICON_SIZE = 780
 ICON_CONTENT_SIZE = 720
 ICON_BOTTOM_PADDING = 30
+GIFT_PANEL_SIZE = (780, 904)
+GIFT_PANEL_SLOT_CENTER = (106, 260)
+GIFT_PANEL_ICON_SIZE = 112
+GIFT_PANEL_FONT_SIZE = 18
+GIFT_PANEL_LINE_HEIGHT = 24
+GIFT_PANEL_NAME_MAX_WIDTH = 180
+GIFT_PANEL_PRICE = 1000
+GIFT_PANEL_TEXT_COLOR = (255, 255, 255, 191)
+GIFT_PANEL_MASK_BOTTOM_TO_NAME = 16
+GIFT_PANEL_COIN_SIZE = 20
+GIFT_PANEL_COIN_TEXT_GAP = 4
 LIVE_WIDTH = 780
 LIVE_HEIGHT = 1688
 LIVE_SLOT_X = 0
@@ -309,6 +324,109 @@ def inspect_existing_icon(path: Path) -> dict[str, Any]:
         }
 
 
+def load_gift_panel_font() -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    if GIFT_PANEL_FONT_PATH.is_file():
+        return ImageFont.truetype(str(GIFT_PANEL_FONT_PATH), GIFT_PANEL_FONT_SIZE)
+    return ImageFont.load_default()
+
+
+def truncate_panel_name(name: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> str:
+    if font.getlength(name) <= GIFT_PANEL_NAME_MAX_WIDTH:
+        return name
+    suffix = "..."
+    shortened = name
+    while shortened and font.getlength(shortened + suffix) > GIFT_PANEL_NAME_MAX_WIDTH:
+        shortened = shortened[:-1]
+    return shortened + suffix if shortened else suffix
+
+
+def process_gift_panel(icon_path: Path, output: Path, gift_name: str) -> dict[str, Any]:
+    """Place the transparent icon in Creative Agent's 780x904 gift-store template."""
+    started = time.perf_counter()
+    with Image.open(GIFT_PANEL_TEMPLATE_PATH) as source:
+        panel = source.convert("RGBA")
+    if panel.size != GIFT_PANEL_SIZE:
+        raise ValueError(f"gift panel template must be {GIFT_PANEL_SIZE}, got {panel.size}")
+
+    with Image.open(icon_path) as source:
+        gift = source.convert("RGBA").resize(
+            (GIFT_PANEL_ICON_SIZE, GIFT_PANEL_ICON_SIZE),
+            Image.Resampling.LANCZOS,
+        )
+    center_x, center_y = GIFT_PANEL_SLOT_CENTER
+    panel.alpha_composite(
+        gift,
+        (
+            center_x - GIFT_PANEL_ICON_SIZE // 2,
+            center_y - GIFT_PANEL_ICON_SIZE // 2,
+        ),
+    )
+
+    text_layer = Image.new("RGBA", panel.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(text_layer)
+    font = load_gift_panel_font()
+    display_name = truncate_panel_name(gift_name.strip() or "Community Gift", font)
+    name_y = center_y + GIFT_PANEL_ICON_SIZE // 2 + GIFT_PANEL_MASK_BOTTOM_TO_NAME
+    draw.text(
+        (center_x, name_y),
+        display_name,
+        fill=GIFT_PANEL_TEXT_COLOR,
+        font=font,
+        anchor="mt",
+    )
+
+    price_text = str(GIFT_PANEL_PRICE)
+    price_width = font.getlength(price_text)
+    price_y = name_y + GIFT_PANEL_LINE_HEIGHT
+    coin = None
+    if GIFT_PANEL_COIN_PATH.is_file():
+        with Image.open(GIFT_PANEL_COIN_PATH) as source:
+            coin = source.convert("RGBA").resize(
+                (GIFT_PANEL_COIN_SIZE, GIFT_PANEL_COIN_SIZE),
+                Image.Resampling.LANCZOS,
+            )
+    total_width = price_width
+    if coin is not None:
+        total_width += GIFT_PANEL_COIN_SIZE + GIFT_PANEL_COIN_TEXT_GAP
+    group_x = center_x - total_width / 2
+    if coin is not None:
+        coin_y = price_y + (GIFT_PANEL_LINE_HEIGHT - GIFT_PANEL_COIN_SIZE) // 2
+        text_layer.alpha_composite(coin, (round(group_x), coin_y))
+        text_x = round(group_x) + GIFT_PANEL_COIN_SIZE + GIFT_PANEL_COIN_TEXT_GAP
+    else:
+        text_x = round(group_x)
+    draw.text((text_x, price_y), price_text, fill=GIFT_PANEL_TEXT_COLOR, font=font)
+    panel = Image.alpha_composite(panel, text_layer)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(".tmp.png")
+    panel.save(temporary, format="PNG", optimize=True)
+    os.replace(temporary, output)
+    return {
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "dimensions": {"width": panel.width, "height": panel.height},
+        "template": rel(GIFT_PANEL_TEMPLATE_PATH),
+        "slot_center": {"x": center_x, "y": center_y},
+        "icon_size": GIFT_PANEL_ICON_SIZE,
+        "gift_name": display_name,
+        "price": GIFT_PANEL_PRICE,
+    }
+
+
+def inspect_existing_gift_panel(path: Path) -> dict[str, Any]:
+    with Image.open(path) as image:
+        return {
+            "status": "succeeded",
+            "reused": True,
+            "elapsed_seconds": 0.0,
+            "dimensions": {"width": image.width, "height": image.height},
+            "template": rel(GIFT_PANEL_TEMPLATE_PATH),
+            "slot_center": {"x": GIFT_PANEL_SLOT_CENTER[0], "y": GIFT_PANEL_SLOT_CENTER[1]},
+            "icon_size": GIFT_PANEL_ICON_SIZE,
+            "price": GIFT_PANEL_PRICE,
+        }
+
+
 def inspect_existing_video(path: Path) -> dict[str, Any]:
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
@@ -571,7 +689,7 @@ def build_viewer_html(manifest: dict[str, Any]) -> str:
     .identity{{padding:16px 18px;background:var(--card);border:1px solid var(--line);border-radius:14px;margin-bottom:18px;display:flex;gap:16px;align-items:center}}
     .identity h2{{margin:0 0 3px;font-size:18px}} .meta{{color:var(--muted)}} .key{{display:inline-flex;align-items:center;gap:7px;padding:4px 8px;border:1px solid var(--line);border-radius:99px}}
     .swatch{{width:13px;height:13px;border-radius:50%;box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}}
-    .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}} .card{{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}}
+    .section-title{{margin:24px 0 10px;font-size:17px}} .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}} .card{{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}}
     .card h3{{margin:0;padding:13px 15px;border-bottom:1px solid var(--line);font-size:15px}} .media{{min-height:360px;display:flex;align-items:center;justify-content:center;background:#111;overflow:hidden}}
     .media.checker{{background-color:#fff;background-image:linear-gradient(45deg,#ddd 25%,transparent 25%),linear-gradient(-45deg,#ddd 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#ddd 75%),linear-gradient(-45deg,transparent 75%,#ddd 75%);background-size:28px 28px;background-position:0 0,0 14px,14px -14px,-14px 0}}
     img,video{{display:block;max-width:100%;max-height:720px;object-fit:contain}} video{{width:100%;background:#111}} .status{{color:var(--ok);font-weight:600}}
@@ -598,11 +716,16 @@ def build_viewer_html(manifest: dict[str, Any]) -> str:
       <span class="spacer"></span>
       <span class="key"><i class="swatch" id="keySwatch"></i><span id="keyText"></span></span>
     </section>
+    <h2 class="section-title" data-i18n="finalMocks">最终展示 Mock</h2>
+    <section class="grid">
+      <article class="card"><h3 data-i18n="giftPanel">送礼物界面 · Gift Panel</h3><div class="media"><img id="giftPanelImage" alt=""></div></article>
+      <article class="card"><h3 data-i18n="panelVideo">礼物送出界面 · BG71 视频</h3><div class="media"><video id="previewVideo" controls muted playsinline preload="metadata"></video></div></article>
+    </section>
+    <h2 class="section-title" data-i18n="processingEvidence">抠图处理证据</h2>
     <section class="grid">
       <article class="card"><h3 data-i18n="originalImage">原始幕布图片</h3><div class="media"><img id="originalImage" alt=""></div></article>
       <article class="card"><h3 data-i18n="transparentIcon">透明 Icon · 780×780</h3><div class="media checker"><img id="iconImage" alt=""></div></article>
       <article class="card"><h3 data-i18n="originalVideo">原始幕布视频</h3><div class="media"><video id="originalVideo" controls muted playsinline preload="metadata"></video></div></article>
-      <article class="card"><h3 data-i18n="panelVideo">BG71 直播间面板视频</h3><div class="media"><video id="previewVideo" controls muted playsinline preload="metadata"></video></div></article>
     </section>
   </main>
   <footer data-i18n="footer">Windows 设计验证版 · 色键抠图 · 原素材保持不变</footer>
@@ -610,13 +733,15 @@ def build_viewer_html(manifest: dict[str, Any]) -> str:
   <script>
     const DATA=JSON.parse(document.getElementById('matting-data').textContent); const rows=DATA.items;
     const TEXT={{zh:{{title:'抠图效果预览',review:'返回结果审核台',workflow:'工作流画布',previous:'上一位',next:'下一位',originalImage:'原始幕布图片',transparentIcon:'透明 Icon · 780×780',originalVideo:'原始幕布视频',panelVideo:'BG71 直播间面板视频',footer:'Seedance 源视频为 5 秒 · 面板预览取首帧开始的前 3 秒 · 原素材保持不变',success:'处理成功',failed:'处理失败',row:'第'}},en:{{title:'Matting Preview',review:'Back to Review',workflow:'Workflow Canvas',previous:'Previous',next:'Next',originalImage:'Original Chroma Image',transparentIcon:'Transparent Icon · 780×780',originalVideo:'Original Chroma Video',panelVideo:'BG71 Live Panel Video',footer:'Seedance source: 5s · Panel preview: first 3s from frame 0 · Original assets preserved',success:'Processed',failed:'Processing Failed',row:'Row'}}}};
+    Object.assign(TEXT.zh,{{title:'礼物双场景 Mock 预览',finalMocks:'最终展示 Mock',processingEvidence:'抠图处理证据',giftPanel:'送礼物界面 · Gift Panel',panelVideo:'礼物送出界面 · BG71 视频',footer:'送礼面板使用透明 Icon · 送出视频取 Seedance 首帧开始的前 3 秒 · 原素材保持不变'}});
+    Object.assign(TEXT.en,{{title:'Gift Experience Mock Preview',finalMocks:'Final Experience Mocks',processingEvidence:'Matting Evidence',giftPanel:'Gift Selection Screen · Gift Panel',panelVideo:'Gift Sent Screen · BG71 Video',footer:'Gift panel uses the transparent icon · Sent animation uses the first 3 seconds from frame 0 · Original assets preserved'}});
     let language=localStorage.getItem('mattingDemoLanguage')==='en'?'en':'zh'; let current=0;
     const $=id=>document.getElementById(id); const rowSelect=$('rowSelect');
-    function applyLanguage(){{document.documentElement.lang=language==='en'?'en':'zh-CN'; document.querySelectorAll('[data-i18n]').forEach(node=>node.textContent=TEXT[language][node.dataset.i18n]); $('languageButton').textContent=language==='zh'?'English':'中文'; document.title=TEXT[language].title; renderSelect(); render();}}
+    function applyLanguage(){{document.documentElement.lang=language==='en'?'en':'zh-CN'; document.querySelectorAll('[data-i18n]').forEach(node=>node.textContent=TEXT[language][node.dataset.i18n]); $('languageButton').textContent=language==='zh'?'English':'Chinese'; document.title=TEXT[language].title; renderSelect(); render();}}
     function renderSelect(){{const value=String(current); rowSelect.innerHTML=rows.map((item,index)=>`<option value="${{index}}">${{TEXT[language].row}} ${{String(item.row_id).padStart(3,'0')}} · ${{escapeHtml(item.host_name||item.anchor_id)}}</option>`).join(''); rowSelect.value=value;}}
     function escapeHtml(value){{return String(value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]));}}
     function setVideo(element,source){{element.pause(); element.removeAttribute('src'); if(source)element.src=source; element.load();}}
-    function render(){{if(!rows.length)return; const item=rows[current]; rowSelect.value=String(current); $('hostName').textContent=item.host_name||item.anchor_id; $('communityName').textContent=item.community_name||item.anchor_id; $('keySwatch').style.background=item.key_color_hex; $('keyText').textContent=item.key_color_hex; $('rowStatus').textContent=item.status==='succeeded'?TEXT[language].success:TEXT[language].failed; $('originalImage').src=item.input_image; $('iconImage').src=item.icon_path||''; setVideo($('originalVideo'),item.input_video); setVideo($('previewVideo'),item.preview_video||''); $('previousButton').disabled=current===0; $('nextButton').disabled=current===rows.length-1; history.replaceState(null,'',`?row=${{item.row_id}}`);}}
+    function render(){{if(!rows.length)return; const item=rows[current]; rowSelect.value=String(current); $('hostName').textContent=item.host_name||item.anchor_id; $('communityName').textContent=item.community_name||item.anchor_id; $('keySwatch').style.background=item.key_color_hex; $('keyText').textContent=item.key_color_hex; $('rowStatus').textContent=item.status==='succeeded'?TEXT[language].success:TEXT[language].failed; $('giftPanelImage').src=item.gift_panel_path||''; $('originalImage').src=item.input_image; $('iconImage').src=item.icon_path||''; setVideo($('originalVideo'),item.input_video); setVideo($('previewVideo'),item.preview_video||''); $('previousButton').disabled=current===0; $('nextButton').disabled=current===rows.length-1; history.replaceState(null,'',`?row=${{item.row_id}}`);}}
     rowSelect.addEventListener('change',()=>{{current=Number(rowSelect.value);render();}}); $('previousButton').addEventListener('click',()=>{{current=Math.max(0,current-1);renderSelect();render();}}); $('nextButton').addEventListener('click',()=>{{current=Math.min(rows.length-1,current+1);renderSelect();render();}}); $('languageButton').addEventListener('click',()=>{{language=language==='zh'?'en':'zh';localStorage.setItem('mattingDemoLanguage',language);applyLanguage();}});
     const requested=Number(new URLSearchParams(location.search).get('row')); const found=rows.findIndex(item=>item.row_id===requested); if(found>=0)current=found; applyLanguage();
   </script>
@@ -649,6 +774,17 @@ def main() -> int:
         sys.stderr.reconfigure(errors="replace")
     args = parse_args()
     selected_rows = parse_rows(args.rows)
+    previous_items: dict[int, dict[str, Any]] = {}
+    if MANIFEST_PATH.is_file():
+        try:
+            previous_manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+            previous_items = {
+                int(item["row_id"]): item
+                for item in previous_manifest.get("items", [])
+                if item.get("row_id") is not None
+            }
+        except (OSError, ValueError, TypeError):
+            previous_items = {}
     if not 0 <= args.gpu_util_threshold <= 100:
         raise ValueError("--gpu-util-threshold must be between 0 and 100")
     scheduler = MattingScheduler(
@@ -668,12 +804,15 @@ def main() -> int:
         raise FileNotFoundError(INDEX_PATH)
     if not BG_PATH.is_file():
         raise FileNotFoundError(BG_PATH)
+    if not GIFT_PANEL_TEMPLATE_PATH.is_file():
+        raise FileNotFoundError(GIFT_PANEL_TEMPLATE_PATH)
     with Image.open(BG_PATH) as background_source:
         background = background_source.convert("RGBA")
     if background.size != (LIVE_WIDTH, LIVE_HEIGHT):
         raise ValueError(f"BG71 must be {LIVE_WIDTH}x{LIVE_HEIGHT}, got {background.size}")
 
     ICON_DIR.mkdir(parents=True, exist_ok=True)
+    GIFT_PANEL_DIR.mkdir(parents=True, exist_ok=True)
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any]] = []
     for item in load_workflow_items():
@@ -688,16 +827,19 @@ def main() -> int:
         image_path = safe_asset_path(record["input_image"])
         video_path = safe_asset_path(record["input_video"])
         icon_path = ICON_DIR / f"row{row:03d}_mainline_icon_780.png"
+        gift_panel_path = GIFT_PANEL_DIR / f"row{row:03d}_mainline_gift_panel.png"
         preview_path = VIDEO_DIR / f"row{row:03d}_mainline_bg71.mp4"
         print(f"[{row:03d}] {record['host_name']} - processing")
         result = {
             **record,
             "status": "running",
             "icon_path": rel(icon_path),
+            "gift_panel_path": rel(gift_panel_path),
             "preview_video": "" if args.icons_only else rel(preview_path),
             "input_image_sha256": sha256_file(image_path),
             "input_video_sha256": sha256_file(video_path),
             "icon": {},
+            "gift_panel": {},
             "video": {},
             "errors": {},
         }
@@ -730,10 +872,31 @@ def main() -> int:
                 result["icon"] = {"status": "failed"}
                 result["errors"]["icon"] = str(exc)
                 print(f"[{row:03d}] icon failed: {exc}", file=sys.stderr)
+        if result["icon"].get("status") != "succeeded":
+            result["gift_panel"] = {"status": "skipped"}
+        elif gift_panel_path.is_file() and not args.force:
+            result["gift_panel"] = inspect_existing_gift_panel(gift_panel_path)
+        else:
+            try:
+                panel_details = process_gift_panel(
+                    icon_path,
+                    gift_panel_path,
+                    record["community_name"],
+                )
+                result["gift_panel"] = {"status": "succeeded", "reused": False, **panel_details}
+            except Exception as exc:
+                gift_panel_path.unlink(missing_ok=True)
+                result["gift_panel"] = {"status": "failed"}
+                result["errors"]["gift_panel"] = str(exc)
+                print(f"[{row:03d}] gift panel failed: {exc}", file=sys.stderr)
         if args.icons_only:
             result["video"] = {"status": "skipped"}
         elif preview_path.is_file() and not args.force:
-            result["video"] = inspect_existing_video(preview_path)
+            previous_video = previous_items.get(row, {}).get("video") or {}
+            if previous_video.get("status") == "succeeded":
+                result["video"] = {**previous_video, "reused": True, "elapsed_seconds": 0.0}
+            else:
+                result["video"] = inspect_existing_video(preview_path)
         else:
             try:
                 video_decision = scheduler.decide()
@@ -768,7 +931,7 @@ def main() -> int:
                 result["video"] = {"status": "failed"}
                 result["errors"]["video"] = str(exc)
                 print(f"[{row:03d}] video failed: {exc}", file=sys.stderr)
-        required = [result["icon"]["status"]]
+        required = [result["icon"]["status"], result["gift_panel"]["status"]]
         if not args.icons_only:
             required.append(result["video"]["status"])
         result["status"] = "succeeded" if all(status == "succeeded" for status in required) else "failed"
@@ -776,7 +939,7 @@ def main() -> int:
         atomic_write_json(
             MANIFEST_PATH,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": "running",
                 "background": rel(BG_PATH),
                 "scheduler": scheduler.diagnostics(),
@@ -786,12 +949,21 @@ def main() -> int:
 
     succeeded = sum(item["status"] == "succeeded" for item in results)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "succeeded" if results and succeeded == len(results) else "partial",
         "design_prototype": True,
         "background": rel(BG_PATH),
         "scheduler": scheduler.diagnostics(),
         "icon_spec": {"width": ICON_SIZE, "height": ICON_SIZE, "content_max": ICON_CONTENT_SIZE, "anchor": "bottom_center"},
+        "gift_panel_spec": {
+            "width": GIFT_PANEL_SIZE[0],
+            "height": GIFT_PANEL_SIZE[1],
+            "template": rel(GIFT_PANEL_TEMPLATE_PATH),
+            "slot_center": {"x": GIFT_PANEL_SLOT_CENTER[0], "y": GIFT_PANEL_SLOT_CENTER[1]},
+            "icon_size": GIFT_PANEL_ICON_SIZE,
+            "name_source": "community_name",
+            "price": GIFT_PANEL_PRICE,
+        },
         "video_spec": {
             "width": LIVE_WIDTH,
             "height": LIVE_HEIGHT,
