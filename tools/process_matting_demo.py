@@ -282,6 +282,8 @@ def process_icon(
     sampled, inner, outer = tune_key(rgb, declared)
     rgba = scheduler.run_matte(decision, rgb, sampled, inner, outer, matte_rgba)
     icon = icon_from_rgba(rgba)
+    arm_cap_mask = build_arm_cap_mask(np.asarray(icon.getchannel("A")))
+    icon = apply_arm_cap_mask(icon, arm_cap_mask)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".tmp.png")
     icon.save(temporary, format="PNG", optimize=True)
@@ -296,6 +298,7 @@ def process_icon(
         "key_inner": round(inner, 2),
         "key_outer": round(outer, 2),
         "alpha_bbox": alpha_bbox(alpha),
+        "arm_cap_mask": arm_cap_mask,
     }
 
 
@@ -846,8 +849,22 @@ def main() -> int:
             "video": {},
             "errors": {},
         }
-        if icon_path.is_file() and not args.force:
-            result["icon"] = inspect_existing_icon(icon_path)
+        previous_icon = previous_items.get(row, {}).get("icon") or {}
+        previous_icon_mask = previous_icon.get("arm_cap_mask") or {}
+        icon_mask_is_current = all(
+            int(previous_icon_mask.get(field, 0)) > 0
+            for field in (
+                "center_x",
+                "center_y",
+                "radius",
+                "feather_px",
+                "vertical_feather_px",
+                "protect_left_until_x",
+                "left_feather_px",
+            )
+        )
+        if icon_path.is_file() and not args.force and icon_mask_is_current:
+            result["icon"] = {**previous_icon, "reused": True, "elapsed_seconds": 0.0}
         else:
             try:
                 icon_decision = scheduler.decide()
@@ -880,6 +897,7 @@ def main() -> int:
         elif (
             gift_panel_path.is_file()
             and not args.force
+            and result["icon"].get("reused") is True
             and int((previous_items.get(row, {}).get("gift_panel") or {}).get("icon_size", 0)) == GIFT_PANEL_ICON_SIZE
             and (previous_items.get(row, {}).get("gift_panel") or {}).get("gift_name") == GIFT_PANEL_NAME
         ):
@@ -962,7 +980,21 @@ def main() -> int:
         "design_prototype": True,
         "background": rel(BG_PATH),
         "scheduler": scheduler.diagnostics(),
-        "icon_spec": {"width": ICON_SIZE, "height": ICON_SIZE, "content_max": ICON_CONTENT_SIZE, "anchor": "bottom_center"},
+        "icon_spec": {
+            "width": ICON_SIZE,
+            "height": ICON_SIZE,
+            "content_max": ICON_CONTENT_SIZE,
+            "anchor": "bottom_center",
+            "arm_cap_mask": {
+                "enabled": True,
+                "start_ratio": ARM_CAP_START_RATIO,
+                "radius_ratio": ARM_CAP_RADIUS_RATIO,
+                "feather_px": ARM_CAP_FEATHER_PX,
+                "vertical_feather_px": ARM_CAP_VERTICAL_FEATHER_PX,
+                "left_protect_ratio": ARM_CAP_LEFT_PROTECT_RATIO,
+                "left_feather_px": ARM_CAP_LEFT_FEATHER_PX,
+            },
+        },
         "gift_panel_spec": {
             "width": GIFT_PANEL_SIZE[0],
             "height": GIFT_PANEL_SIZE[1],

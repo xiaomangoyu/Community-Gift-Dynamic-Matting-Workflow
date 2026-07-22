@@ -79,6 +79,23 @@ def main() -> int:
                 errors.append(f"row {row:03d}: icon alpha is empty or opaque")
             if any(int(alpha[y, x]) != 0 for x, y in ((0, 0), (779, 0), (0, 779), (779, 779))):
                 errors.append(f"row {row:03d}: icon corners are not transparent")
+        icon_meta = item.get("icon", {})
+        icon_arm_cap = icon_meta.get("arm_cap_mask") or {}
+        if not all(
+            int(icon_arm_cap.get(field, 0)) > 0
+            for field in (
+                "center_x",
+                "center_y",
+                "radius",
+                "feather_px",
+                "vertical_feather_px",
+                "protect_left_until_x",
+                "left_feather_px",
+            )
+        ):
+            errors.append(f"row {row:03d}: missing or invalid icon arm cap mask")
+        elif int(icon_arm_cap["center_y"]) + int(icon_arm_cap["radius"]) >= 780:
+            errors.append(f"row {row:03d}: icon arm cap extends outside the 780px canvas")
         with Image.open(gift_panel) as panel_image:
             if panel_image.size != (780, 904) or panel_image.mode != "RGBA":
                 errors.append(f"row {row:03d}: invalid gift panel {panel_image.mode} {panel_image.size}")
