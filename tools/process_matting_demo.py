@@ -45,7 +45,9 @@ ICON_CONTENT_SIZE = 720
 ICON_BOTTOM_PADDING = 30
 GIFT_PANEL_SIZE = (780, 904)
 GIFT_PANEL_SLOT_CENTER = (106, 260)
-GIFT_PANEL_ICON_SIZE = 112
+GIFT_PANEL_SLOT_MASK_SIZE = 112
+GIFT_PANEL_ICON_SIZE = round(GIFT_PANEL_SLOT_MASK_SIZE * 1.10)
+GIFT_PANEL_NAME = "Community"
 GIFT_PANEL_FONT_SIZE = 18
 GIFT_PANEL_LINE_HEIGHT = 24
 GIFT_PANEL_NAME_MAX_WIDTH = 180
@@ -365,8 +367,8 @@ def process_gift_panel(icon_path: Path, output: Path, gift_name: str) -> dict[st
     text_layer = Image.new("RGBA", panel.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(text_layer)
     font = load_gift_panel_font()
-    display_name = truncate_panel_name(gift_name.strip() or "Community Gift", font)
-    name_y = center_y + GIFT_PANEL_ICON_SIZE // 2 + GIFT_PANEL_MASK_BOTTOM_TO_NAME
+    display_name = truncate_panel_name(gift_name.strip() or GIFT_PANEL_NAME, font)
+    name_y = center_y + GIFT_PANEL_SLOT_MASK_SIZE // 2 + GIFT_PANEL_MASK_BOTTOM_TO_NAME
     draw.text(
         (center_x, name_y),
         display_name,
@@ -423,6 +425,7 @@ def inspect_existing_gift_panel(path: Path) -> dict[str, Any]:
             "template": rel(GIFT_PANEL_TEMPLATE_PATH),
             "slot_center": {"x": GIFT_PANEL_SLOT_CENTER[0], "y": GIFT_PANEL_SLOT_CENTER[1]},
             "icon_size": GIFT_PANEL_ICON_SIZE,
+            "gift_name": GIFT_PANEL_NAME,
             "price": GIFT_PANEL_PRICE,
         }
 
@@ -874,14 +877,19 @@ def main() -> int:
                 print(f"[{row:03d}] icon failed: {exc}", file=sys.stderr)
         if result["icon"].get("status") != "succeeded":
             result["gift_panel"] = {"status": "skipped"}
-        elif gift_panel_path.is_file() and not args.force:
+        elif (
+            gift_panel_path.is_file()
+            and not args.force
+            and int((previous_items.get(row, {}).get("gift_panel") or {}).get("icon_size", 0)) == GIFT_PANEL_ICON_SIZE
+            and (previous_items.get(row, {}).get("gift_panel") or {}).get("gift_name") == GIFT_PANEL_NAME
+        ):
             result["gift_panel"] = inspect_existing_gift_panel(gift_panel_path)
         else:
             try:
                 panel_details = process_gift_panel(
                     icon_path,
                     gift_panel_path,
-                    record["community_name"],
+                    GIFT_PANEL_NAME,
                 )
                 result["gift_panel"] = {"status": "succeeded", "reused": False, **panel_details}
             except Exception as exc:
@@ -961,7 +969,8 @@ def main() -> int:
             "template": rel(GIFT_PANEL_TEMPLATE_PATH),
             "slot_center": {"x": GIFT_PANEL_SLOT_CENTER[0], "y": GIFT_PANEL_SLOT_CENTER[1]},
             "icon_size": GIFT_PANEL_ICON_SIZE,
-            "name_source": "community_name",
+            "name_source": "fixed_demo_label",
+            "gift_name": GIFT_PANEL_NAME,
             "price": GIFT_PANEL_PRICE,
         },
         "video_spec": {

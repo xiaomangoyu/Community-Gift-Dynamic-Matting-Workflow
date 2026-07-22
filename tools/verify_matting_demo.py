@@ -90,6 +90,10 @@ def main() -> int:
         panel_meta = item.get("gift_panel", {})
         if panel_meta.get("status") != "succeeded":
             errors.append(f"row {row:03d}: gift panel did not succeed")
+        if panel_meta.get("gift_name") != "Community":
+            errors.append(f"row {row:03d}: gift panel name is not Community")
+        if int(panel_meta.get("icon_size", 0)) != 123:
+            errors.append(f"row {row:03d}: gift panel icon is not 123px")
         if int(panel_meta.get("price", 0)) != 1000:
             errors.append(f"row {row:03d}: gift panel price is not 1000")
         source_duration, source_fps, source_frames, _, _ = duration_and_frames(video)
